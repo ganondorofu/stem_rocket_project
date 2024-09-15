@@ -55,8 +55,8 @@ void setup() {
 
 void loop() {
   int ret;
-  int8_t msgid = 100;
-  uint32_t dummy_data = 0;
+  int8_t msgid;
+  uint32_t dummy_data;
 
   ret = MP.Recv(&msgid, &dummy_data);
   if (ret < 0) {
@@ -87,7 +87,6 @@ void loop() {
   msg.gpsAltitude = 0;
   msg.fix = 0;
   msg.satellites = 0;
-
   strcpy(msg.imageFilename, "");  // Set by the main core
 
   ret = MP.Send(msgid, &msg);
@@ -116,7 +115,7 @@ void loop() {
     Serial.print(" deg/s, Gyro Y: ");
     Serial.print(msg.gyroY);
     Serial.print(" deg/s, Gyro Z: ");
-    Serial.println(msg.gyroZ);
+    Serial.print(msg.gyroZ);
     Serial.println(" deg/s");
   }
 }
