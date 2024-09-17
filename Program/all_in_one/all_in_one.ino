@@ -7,10 +7,13 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <MPU6050.h>
+#include <Servo.h>
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define CSV_FILENAME "sensor_data.csv"
 #define LOG_FILENAME "event_log.txt"
+#define BUTTON_PIN PIN_D02
+#define SERVO_PIN PIN_D09
 
 enum ParamSat {
   eSatGps,
@@ -34,10 +37,15 @@ SpNavData navData;
 SpGnss gnss;
 Adafruit_BME280 bme;
 MPU6050 mpu;
+Servo servo;
 
 int imageCounter = 0;
 unsigned long startTime;
 bool isLifted = false;
+int servoPosition = 0; 
+int lastButtonState = HIGH;
+
+static Servo s_servo;
 
 struct sensorDataMsg {
   float temperature;
@@ -70,6 +78,7 @@ void setup() {
   initGNSS();
   initBME280();
   initMPU6050();
+  initServo();
 
   if (!SD.begin()) {
     Serial.println("Error: SD card initialization failed. Please check the SD card.");
@@ -87,6 +96,7 @@ void loop() {
   recordSensorData();
   checkLifted();
   captureImage();
+  checkButton();
   delay(1000);
 }
 
@@ -114,7 +124,6 @@ void initGNSS() {
     errorLoop(2);
   }
 
-  // 衛星システムの選択
   switch (satType) {
     case eSatGps:
       gnss.select(GPS);
@@ -188,6 +197,13 @@ void initMPU6050() {
     Serial.println("MPU6050 connection failed");
     errorLoop(4);
   }
+}
+
+void initServo() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  servo.attach(SERVO_PIN);
+  servo.write(0);  // Initialize servo to 0 degrees
+  Serial.println("Servo initialized to 0 degrees");
 }
 
 void captureImage() {
@@ -349,6 +365,34 @@ void checkLifted() {
     isLifted = false;
     event("Device returned to rest");
   }
+}
+
+void checkButton() {
+  int currentButtonState = digitalRead(BUTTON_PIN);
+
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    // ボタンが押されたとき
+    servoPosition = (servoPosition + 1) % 3;  // 0 -> 1 -> 2 -> 0 とループする
+    
+    switch (servoPosition) {
+      case 0:
+        servo.write(0);
+        event("Servo moved to 0 degrees");
+        break;
+      case 1:
+        servo.write(180);
+        event("Servo moved to 180 degrees");
+        break;
+      case 2:
+        servo.write(0);
+        event("Servo returned to 0 degrees");
+        break;
+    }
+    
+    delay(50);  // デバウンス遅延
+  }
+
+  lastButtonState = currentButtonState;
 }
 
 void printError(enum CamErr err) {
