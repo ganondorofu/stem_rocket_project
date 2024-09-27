@@ -42,7 +42,7 @@ Servo servo;
 int imageCounter = 0;
 unsigned long startTime;
 bool isLifted = false;
-int servoPosition = 0; 
+int servoPosition = 0;
 int lastButtonState = HIGH;
 
 static Servo s_servo;
@@ -97,7 +97,7 @@ void loop() {
   checkLifted();
   captureImage();
   checkButton();
-  delay(1000);
+  //delay(1000);
 }
 
 void initCamera() {
@@ -373,7 +373,7 @@ void checkButton() {
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     // ボタンが押されたとき
     servoPosition = (servoPosition + 1) % 3;  // 0 -> 1 -> 2 -> 0 とループする
-    
+
     switch (servoPosition) {
       case 0:
         servo.write(0);
@@ -388,7 +388,7 @@ void checkButton() {
         event("Servo returned to 0 degrees");
         break;
     }
-    
+
     delay(50);  // デバウンス遅延
   }
 
