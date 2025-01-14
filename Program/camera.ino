@@ -59,3 +59,14 @@ void setup() {
 }
 
 void loop() {}
+
+
+/*
+参照元
+https://ja.stackoverflow.com/questions/91100/%E5%8B%95%E7%94%BB%E6%92%AE%E5%BD%B1%E3%81%AE%E9%AB%98%E9%80%9F%E5%8C%96
+
+AviLibraryは手動で入れないと行けないお
+stackoverflowに載ってるgithubからコードのzipをdl
+IDEのスケッチ->ライブラリのインクルード->zip
+でdlしたファイルを選択
+*/
