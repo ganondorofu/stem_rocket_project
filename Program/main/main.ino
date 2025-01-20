@@ -1,103 +1,129 @@
-#include <Camera.h>
-#include <SDHCI.h>
 #include <Wire.h>
-#include <MPU6050.h>
-#include <Servo.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h> // BME280センサー制御用ライブラリ
+#include <Servo.h> // サーボモーター制御用ライブラリ
 
-SDClass theSD;
-MPU6050 mpu;
-Servo servo;
+Adafruit_MPU6050 mpu;
+Adafruit_BME280 bme; // BME280センサーのインスタンス
+Servo servo; // サーボモーターのインスタンス
 
-String baseFilename = "frame_";  // ファイル名のベース
-int frameCount = 0;  // 保存されたフレーム数のカウント
-bool isLifted = false;  // 持ち上げた状態を表すフラグ
-int16_t prevAz = 0;  // 前回のZ軸加速度
-
-void CamCB(CamImage img) {
-  const static uint32_t recording_time_in_ms = 60000;  /* msec */
-  static uint32_t start_time = millis();
-
-  if (img.isAvailable()) {
-    uint32_t duration = millis() - start_time;
-    if (duration > recording_time_in_ms) {
-      // 録画終了
-      theCamera.end();
-      Serial.println("Recording ended.");
-      while (true) {
-        digitalWrite(LED0, HIGH);
-        delay(100);
-        digitalWrite(LED0, LOW);
-        delay(100);
-      }
-    } else {
-      // フレームごとに画像を保存
-      String filename = baseFilename + String(frameCount) + ".jpg";  // 例: frame_0.jpg, frame_1.jpg
-      File imgFile = theSD.open(filename, FILE_WRITE);
-
-      if (imgFile) {
-        imgFile.write(img.getImgBuff(), img.getImgSize());  // 画像バッファをSDカードに保存
-        imgFile.close();
-        Serial.println("Saved: " + filename);
-        frameCount++;  // フレームカウントを更新
-      } else {
-        Serial.println("Failed to save: " + filename);
-      }
-    }
-  }
-}
+const int servoPin = 9; // サーボモーター接続ピン
+const float thresholdG = 15.0; // 上方向のG検知の閾値 (m/s^2)
+const int ledPin = PIN_LED0; // SpresenseのオンボードLEDピン（PIN_LED0などボード仕様に応じる）
+const int inputPin = 10; // 入力ピン
 
 void setup() {
   Serial.begin(115200);
-
-  // SDカードのチェック
-  while (!theSD.begin()) {
-    Serial.println("Insert SD card");
-    delay(1000);
+  while (!Serial) {
+    delay(10); // シリアルポートが準備できるまで待機
   }
 
-  // Cameraの設定
-  const int buff_num = 2;
-  theCamera.begin(buff_num, CAM_VIDEO_FPS_30, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V, CAM_IMAGE_PIX_FMT_JPG, 5);
+  // サーボモーターの初期化
+  servo.attach(servoPin);
+  servo.write(90); // 初期位置を90度に設定
 
-  // ストリーミングを開始
-  theCamera.startStreaming(true, CamCB);
-  Serial.println("Start capturing frames...");
+  // オンボードLEDピンを出力モードに設定
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW); // 初期状態でLEDをオフに設定
 
-  // MPU6050の設定
-  Wire.begin();  // SDA=D14, SCL=D15を使用
-  mpu.initialize();
-  if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed");
-    while (1);
+  // 入力ピンを入力モードに設定
+  pinMode(inputPin, INPUT);
+
+  // MPU6050を初期化
+  if (!mpu.begin()) {
+    Serial.println("MPU6050の初期化に失敗しました。接続を確認してください。");
+    while (1) {
+      delay(10);
+    }
   }
-  Serial.println("MPU6050 connected");
+  Serial.println("MPU6050の初期化に成功しました！");
 
-  // Servoの設定
-  servo.attach(8);  // Servoを8番ピンに接続
-  servo.write(0);  // 初期位置
+  // BME280を初期化
+  if (!bme.begin(0x76)) { // I2Cアドレスは通常0x76または0x77
+    Serial.println("BME280の初期化に失敗しました。接続を確認してください。");
+    while (1) {
+      delay(10);
+    }
+  }
+  Serial.println("BME280の初期化に成功しました！");
+
+  // センサー設定の調整（必要に応じて変更可能）
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  delay(100); // センサーの安定化のため少し待つ
 }
 
 void loop() {
-  // MPU6050から値を取得
-  int16_t ax, ay, az;
-  mpu.getAcceleration(&ax, &ay, &az);
+  /* 加速度センサーのデータを取得 */
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
 
-  // Z軸の変化量を計算
-  int16_t deltaAz = abs(az - prevAz);
+  // 加速度データを表示 (m/s^2)
+  Serial.print("加速度 X: ");
+  Serial.print(a.acceleration.x);
+  Serial.print(", Y: ");
+  Serial.print(a.acceleration.y);
+  Serial.print(", Z: ");
+  Serial.print(a.acceleration.z);
+  Serial.println(" m/s^2");
 
-  // 閾値（変化量）で判定
-  if (deltaAz > 2000 && !isLifted) {  // 変化量の閾値は調整可能
-    isLifted = true;
-    Serial.println("Lift detected, moving servo");
+  // ジャイロデータを表示 (°/s)
+  Serial.print("ジャイロ X: ");
+  Serial.print(g.gyro.x);
+  Serial.print(", Y: ");
+  Serial.print(g.gyro.y);
+  Serial.print(", Z: ");
+  Serial.print(g.gyro.z);
+  Serial.println(" °/s");
 
-    // Servoを動かす
-    servo.write(90);  // 90度の位置
-    delay(1000);  // 1秒間位置を保持
-    servo.write(0);  // 元の位置に戻す
-    delay(1000);
-    isLifted = false;
+  // 温度データを表示 (°C)
+  Serial.print("温度: ");
+  Serial.print(temp.temperature);
+  Serial.println(" °C");
+
+  Serial.println("----------------------------------");
+
+  // BME280センサーのデータを取得
+  float temperature = bme.readTemperature();
+  float pressure = bme.readPressure() / 100.0F; // hPaに変換
+  float humidity = bme.readHumidity();
+
+  // BME280センサーのデータを表示
+  Serial.print("BME280 温度: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
+
+  Serial.print("BME280 気圧: ");
+  Serial.print(pressure);
+  Serial.println(" hPa");
+
+  Serial.print("BME280 湿度: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+  Serial.println("----------------------------------");
+
+  // 上方向の強いGを検知
+  if (a.acceleration.z > thresholdG) {
+    Serial.println("強いGを検知しました！サーボモーターを動かします。");
+
+    servo.write(0);  // サーボモーターを0度に動かす
+    delay(1000);     // 1秒待機
+    servo.write(90); // サーボモーターを元の位置（90度）に戻す
   }
 
-  // 現在の加速度を保存
-  prevAz = az;
+  // 入力ピンの状態を読み取る
+  int inputState = digitalRead(inputPin);
+
+  // 入力ピンの状態に応じてオンボードLEDを制御
+  if (inputState == HIGH) {
+    digitalWrite(ledPin, LOW); // LEDをオフ
+  } else {
+    digitalWrite(ledPin, HIGH); // LEDをオン
+  }
+
+  delay(100); // 0.1秒ごとに更新
 }
