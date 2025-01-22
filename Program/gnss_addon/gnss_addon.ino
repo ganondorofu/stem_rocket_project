@@ -1,12 +1,22 @@
 #include <GNSS.h>
 
-#define STRING_BUFFER_SIZE  128       /**< %Buffer size */
+#define STRING_BUFFER_SIZE 128 /**< %Buffer size */
 
-#define RESTART_CYCLE       (60 * 5)  /**< positioning test term */
+#define RESTART_CYCLE (60 * 5) /**< positioning test term */
 
 static SpGnssAddon Gnss;
+bool isFirstUse = true;  // 初回利用を示すフラグ
 
 void setup() {
+
+
+  if (isFirstUse) {
+    Gnss.setStartMode(SpStartMode::COLD_START);
+    isFirstUse = false;  // 次回以降はWARM/HOT_STARTを使用
+  } else {
+    Gnss.setStartMode(SpStartMode::HOT_START);
+  }
+
   int error_flag = 0;
 
   // シリアル通信の初期化
