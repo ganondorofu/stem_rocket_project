@@ -119,7 +119,7 @@ void loop() {
   int inputState = digitalRead(inputPin);
 
   // 入力ピンの状態に応じてオンボードLEDを制御
-  if (inputState == HIGH) {
+  if (inputState != HIGH) {
     digitalWrite(ledPin, LOW); // LEDをオフ
   } else {
     digitalWrite(ledPin, HIGH); // LEDをオン
