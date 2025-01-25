@@ -12,7 +12,7 @@ void setup() {
   Serial.begin(115200);
 
   // LEDの初期化
-  ledOn(PIN_LED0);
+  ledOn(PIN_LED0);c:\Users\ganon\Desktop\stem_rocket_project\Program\auto_lock\auto_lock.ino
   ledOn(PIN_LED1);
   ledOn(PIN_LED2);
   ledOn(PIN_LED3);
