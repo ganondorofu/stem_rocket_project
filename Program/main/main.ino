@@ -1,129 +1,532 @@
+/*******************************************************
+ *  spresense_main.ino
+ *  BME280初期化の修正版
+ *******************************************************/
+
+#include <Arduino.h>
+#include <SDHCI.h>
+#include <File.h>
+#include <Camera.h>
+#include <GNSS.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h> // BME280センサー制御用ライブラリ
-#include <Servo.h> // サーボモーター制御用ライブラリ
+#include <Adafruit_BME280.h>
+#include <MPU6050.h>
 
-Adafruit_MPU6050 mpu;
-Adafruit_BME280 bme; // BME280センサーのインスタンス
-Servo servo; // サーボモーターのインスタンス
+// BME280計算用
+#define SEALEVELPRESSURE_HPA (1013.25)
 
-const int servoPin = 9; // サーボモーター接続ピン
-const float thresholdG = 15.0; // 上方向のG検知の閾値 (m/s^2)
-const int ledPin = PIN_LED0; // SpresenseのオンボードLEDピン（PIN_LED0などボード仕様に応じる）
-const int inputPin = 10; // 入力ピン
+// CSVファイルとログファイル名
+#define CSV_FILENAME "sensor_data.csv"
+#define LOG_FILENAME "event_log.txt"
+
+// バッファや再起動周期などの定義
+#define STRING_BUFFER_SIZE  128
+#define RESTART_CYCLE       (60 * 5)
+
+// Spresense用SDクラスとファイル
+SDClass SD;
+File myFile;
+
+// GNSSとセンサー系
+SpGnss Gnss;
+Adafruit_BME280 bme;
+MPU6050 mpu;
+
+// カメラ関連
+int imageCounter = 0;
+unsigned long startTime;
+
+// GNSSで使用する衛星選択用enum
+enum ParamSat {
+  eSatGps,
+  eSatGlonass,
+  eSatGpsSbas,
+  eSatGpsGlonass,
+  eSatGpsBeidou,
+  eSatGpsGalileo,
+  eSatGpsQz1c,
+  eSatGpsGlonassQz1c,
+  eSatGpsBeidouQz1c,
+  eSatGpsGalileoQz1c,
+  eSatGpsQz1cQz1S,
+};
+static enum ParamSat satType = eSatGpsGlonass;
+
+// センサーのデータ構造体
+struct sensorDataMsg {
+  float temperature;
+  float humidity;
+  float pressure;
+  float altitude;
+  float latitude;
+  float longitude;
+  float gpsAltitude;
+  int fix;
+  int satellites;
+  char imageFilename[32];
+  float accelX;
+  float accelY;
+  float accelZ;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+};
+
+// ループカウンタや時間管理
+static int LoopCount = 0;
+static int LastPrintMin = 0;
+
+// 関数プロトタイプ
+void initCamera();
+void initGNSS();
+void initBME280();
+void initMPU6050();
+void initCSV();
+void captureImage();
+void recordSensorData(SpNavData &NavData);
+void printSensorData(const sensorDataMsg& data);
+void writeToCSV(const sensorDataMsg& data);
+void event(String event_msg);
+void printError(enum CamErr err);
+void errorLoop(int num);
+static void Led_isActive();
+static void Led_isPosfix(bool state);
+static void Led_isError(bool state);
+static void print_pos(SpNavData *pNavData);
+static void print_condition(SpNavData *pNavData);
+void restartGNSS();
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {
-    delay(10); // シリアルポートが準備できるまで待機
+  while (!Serial);
+
+  // 起動時間を記録
+  startTime = millis();
+
+  // I2Cバス初期化 (BME280やMPU6050利用のため)
+  Wire.begin();
+
+  initCamera();
+  initGNSS();
+  initBME280();
+  initMPU6050();
+
+  // SDカード初期化
+  if (!SD.begin()) {
+    Serial.println("Error: SD card initialization failed. Please check the SD card.");
+    while (1);
   }
 
-  // サーボモーターの初期化
-  servo.attach(servoPin);
-  servo.write(90); // 初期位置を90度に設定
+  initCSV();
 
-  // オンボードLEDピンを出力モードに設定
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW); // 初期状態でLEDをオフに設定
-
-  // 入力ピンを入力モードに設定
-  pinMode(inputPin, INPUT);
-
-  // MPU6050を初期化
-  if (!mpu.begin()) {
-    Serial.println("MPU6050の初期化に失敗しました。接続を確認してください。");
-    while (1) {
-      delay(10);
-    }
-  }
-  Serial.println("MPU6050の初期化に成功しました！");
-
-  // BME280を初期化
-  if (!bme.begin(0x76)) { // I2Cアドレスは通常0x76または0x77
-    Serial.println("BME280の初期化に失敗しました。接続を確認してください。");
-    while (1) {
-      delay(10);
-    }
-  }
-  Serial.println("BME280の初期化に成功しました！");
-
-  // センサー設定の調整（必要に応じて変更可能）
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-  delay(100); // センサーの安定化のため少し待つ
+  event("All initialization completed");
 }
 
 void loop() {
-  /* 加速度センサーのデータを取得 */
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  Led_isActive();
 
-  // 加速度データを表示 (m/s^2)
-  Serial.print("加速度 X: ");
-  Serial.print(a.acceleration.x);
-  Serial.print(", Y: ");
-  Serial.print(a.acceleration.y);
-  Serial.print(", Z: ");
-  Serial.print(a.acceleration.z);
-  Serial.println(" m/s^2");
+  if (Gnss.waitUpdate(-1)) {
+    SpNavData NavData;
+    Gnss.getNavData(&NavData);
 
-  // ジャイロデータを表示 (°/s)
-  Serial.print("ジャイロ X: ");
-  Serial.print(g.gyro.x);
-  Serial.print(", Y: ");
-  Serial.print(g.gyro.y);
-  Serial.print(", Z: ");
-  Serial.print(g.gyro.z);
-  Serial.println(" °/s");
+    bool LedSet = (NavData.posDataExist && (NavData.posFixMode != FixInvalid));
+    Led_isPosfix(LedSet);
 
-  // 温度データを表示 (°C)
-  Serial.print("温度: ");
-  Serial.print(temp.temperature);
-  Serial.println(" °C");
+    if (NavData.time.minute != LastPrintMin) {
+      print_condition(&NavData);
+      LastPrintMin = NavData.time.minute;
+    }
 
-  Serial.println("----------------------------------");
+    print_pos(&NavData);
 
-  // BME280センサーのデータを取得
-  float temperature = bme.readTemperature();
-  float pressure = bme.readPressure() / 100.0F; // hPaに変換
-  float humidity = bme.readHumidity();
-
-  // BME280センサーのデータを表示
-  Serial.print("BME280 温度: ");
-  Serial.print(temperature);
-  Serial.println(" °C");
-
-  Serial.print("BME280 気圧: ");
-  Serial.print(pressure);
-  Serial.println(" hPa");
-
-  Serial.print("BME280 湿度: ");
-  Serial.print(humidity);
-  Serial.println(" %");
-
-  Serial.println("----------------------------------");
-
-  // 上方向の強いGを検知
-  if (a.acceleration.z > thresholdG) {
-    Serial.println("強いGを検知しました！サーボモーターを動かします。");
-
-    servo.write(0);  // サーボモーターを0度に動かす
-    delay(1000);     // 1秒待機
-    servo.write(90); // サーボモーターを元の位置（90度）に戻す
-  }
-
-  // 入力ピンの状態を読み取る
-  int inputState = digitalRead(inputPin);
-
-  // 入力ピンの状態に応じてオンボードLEDを制御
-  if (inputState != HIGH) {
-    digitalWrite(ledPin, LOW); // LEDをオフ
+    recordSensorData(NavData);
+    captureImage();
   } else {
-    digitalWrite(ledPin, HIGH); // LEDをオン
+    Serial.println("GNSS data not updated");
   }
 
-  delay(100); // 0.1秒ごとに更新
+  LoopCount++;
+  if (LoopCount >= RESTART_CYCLE) {
+    restartGNSS();
+    LoopCount = 0;
+  }
+
+  delay(1000);
+}
+
+// カメラ初期化
+void initCamera() {
+  CamErr err = theCamera.begin();
+  if (err != CAM_ERR_SUCCESS) {
+    printError(err);
+    errorLoop(1);
+  }
+  err = theCamera.setStillPictureImageFormat(
+    CAM_IMGSIZE_QUADVGA_H,
+    CAM_IMGSIZE_QUADVGA_V,
+    CAM_IMAGE_PIX_FMT_JPG);
+  if (err != CAM_ERR_SUCCESS) {
+    printError(err);
+    errorLoop(1);
+  }
+}
+
+// GNSS初期化
+void initGNSS() {
+  int error_flag = 0;
+  Gnss.setDebugMode(PrintInfo);
+  int result = Gnss.begin();
+  if (result != 0) {
+    Serial.println("Gnss begin error!!");
+    error_flag = 1;
+  } else {
+    switch (satType) {
+      case eSatGps:               Gnss.select(GPS);                  break;
+      case eSatGlonass:           Gnss.select(GLONASS);              break;
+      case eSatGpsSbas:           Gnss.select(GPS); Gnss.select(SBAS);           break;
+      case eSatGpsGlonass:        Gnss.select(GPS); Gnss.select(GLONASS);        break;
+      case eSatGpsBeidou:         Gnss.select(GPS); Gnss.select(BEIDOU);         break;
+      case eSatGpsGalileo:        Gnss.select(GPS); Gnss.select(GALILEO);        break;
+      case eSatGpsQz1c:           Gnss.select(GPS); Gnss.select(QZ_L1CA);        break;
+      case eSatGpsQz1cQz1S:       Gnss.select(GPS); Gnss.select(QZ_L1CA); Gnss.select(QZ_L1S);    break;
+      case eSatGpsBeidouQz1c:     Gnss.select(GPS); Gnss.select(BEIDOU); Gnss.select(QZ_L1CA);    break;
+      case eSatGpsGalileoQz1c:    Gnss.select(GPS); Gnss.select(GALILEO); Gnss.select(QZ_L1CA);   break;
+      case eSatGpsGlonassQz1c:
+      default:
+        Gnss.select(GPS);
+        Gnss.select(GLONASS);
+        Gnss.select(QZ_L1CA);
+        break;
+    }
+    result = Gnss.start(COLD_START);
+    if (result != 0) {
+      Serial.println("Gnss start error!!");
+      error_flag = 1;
+    } else {
+      Serial.println("Gnss setup OK");
+    }
+  }
+  if (error_flag == 1) {
+    Led_isError(true);
+    while(1);
+  }
+}
+
+// BME280初期化
+void initBME280() {
+  // 0x76アドレスの場合
+  if (!bme.begin(0x76)) {
+    Serial.println("Could not find a valid BME280 sensor, check wiring!");
+    errorLoop(3);  // 点滅回数3でエラーループ
+  }
+}
+
+// MPU6050初期化
+void initMPU6050() {
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+    errorLoop(4);
+  }
+}
+
+// 画像ファイル名を作り、写真を撮影してSDに保存
+void captureImage() {
+  char filename[32];
+  snprintf(filename, sizeof(filename), "IMG_%04d.jpg", imageCounter);
+
+  CamImage img = theCamera.takePicture();
+  if (img.isAvailable()) {
+    File myFile = SD.open(filename, FILE_WRITE);
+    if (!myFile) {
+      Serial.println("Failed to write image file");
+      return;
+    }
+    myFile.write(img.getImgBuff(), img.getImgSize());
+    myFile.close();
+    imageCounter++;
+  } else {
+    Serial.println("Failed to capture image");
+  }
+}
+
+// 取得したセンサーデータを構造体にまとめてCSV出力など
+void recordSensorData(SpNavData &NavData) {
+  sensorDataMsg data;
+  data.temperature = bme.readTemperature();
+  data.humidity = bme.readHumidity();
+  data.pressure = bme.readPressure() / 100.0F;
+  data.altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  data.accelX = ax / 16384.0;
+  data.accelY = ay / 16384.0;
+  data.accelZ = az / 16384.0;
+  data.gyroX = gx / 131.0;
+  data.gyroY = gy / 131.0;
+  data.gyroZ = gz / 131.0;
+
+  data.latitude = NavData.latitude;
+  data.longitude = NavData.longitude;
+  data.gpsAltitude = NavData.altitude;
+  data.fix = NavData.posFixMode;
+  data.satellites = NavData.numSatellites;
+
+  snprintf(data.imageFilename, sizeof(data.imageFilename), "IMG_%04d.jpg", imageCounter - 1);
+
+  printSensorData(data);
+  writeToCSV(data);
+}
+
+// センサーデータをシリアルモニタに出力
+void printSensorData(const sensorDataMsg& data) {
+  Serial.print("Temperature: ");
+  Serial.print(data.temperature);
+  Serial.print(" C, Humidity: ");
+  Serial.print(data.humidity);
+  Serial.print(" %, Pressure: ");
+  Serial.print(data.pressure);
+  Serial.print(" hPa, Estimated Altitude: ");
+  Serial.print(data.altitude);
+  Serial.print(" m, Lat: ");
+  Serial.print(data.latitude, 6);
+  Serial.print(", Lng: ");
+  Serial.print(data.longitude, 6);
+  Serial.print(", GPS Alt: ");
+  Serial.print(data.gpsAltitude);
+  Serial.print(" m, Fix: ");
+  Serial.print(data.fix);
+  Serial.print(", Satellites: ");
+  Serial.print(data.satellites);
+  Serial.print(", Image: ");
+  Serial.print(data.imageFilename);
+  Serial.print(", Accel X/Y/Z: ");
+  Serial.print(data.accelX);
+  Serial.print("/");
+  Serial.print(data.accelY);
+  Serial.print("/");
+  Serial.print(data.accelZ);
+  Serial.print(" g, Gyro X/Y/Z: ");
+  Serial.print(data.gyroX);
+  Serial.print("/");
+  Serial.print(data.gyroY);
+  Serial.print("/");
+  Serial.print(data.gyroZ);
+  Serial.println(" deg/s");
+}
+
+// CSVファイル初期化
+void initCSV() {
+  SD.remove(CSV_FILENAME);
+  File dataFile = SD.open(CSV_FILENAME, FILE_WRITE);
+  if (dataFile) {
+    dataFile.println("Time(s),Temp(C),Humidity(%),Pressure(hPa),EstAlt(m),Lat,Lng,GPSAlt(m),Fix,Sats,ImageFilename,AccelX(g),AccelY(g),AccelZ(g),GyroX(deg/s),GyroY(deg/s),GyroZ(deg/s)");
+    dataFile.close();
+  } else {
+    Serial.println("Error: Could not open CSV file");
+  }
+}
+
+// CSVに書き込み
+void writeToCSV(const sensorDataMsg& data) {
+  File dataFile = SD.open(CSV_FILENAME, FILE_WRITE);
+  if (dataFile) {
+    char buffer[512];
+    unsigned long currentTime = millis();
+    float elapsedSeconds = (currentTime - startTime) / 1000.0;
+
+    int len = snprintf(
+      buffer, sizeof(buffer),
+      "%.3f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+      elapsedSeconds,
+      data.temperature, data.humidity, data.pressure, data.altitude,
+      data.latitude, data.longitude, data.gpsAltitude,
+      data.fix, data.satellites, data.imageFilename,
+      data.accelX, data.accelY, data.accelZ,
+      data.gyroX, data.gyroY, data.gyroZ
+    );
+
+    if (len >= 0 && len < (int)sizeof(buffer)) {
+      dataFile.println(buffer);
+    } else {
+      Serial.println("Error: Failed to create string with snprintf");
+    }
+    dataFile.close();
+  } else {
+    Serial.println("Error: Could not open CSV file");
+  }
+}
+
+// イベントログ
+void event(String event_msg) {
+  unsigned long currentTime = millis();
+  float elapsedSeconds = (currentTime - startTime) / 1000.0;
+  String logMessage = String(elapsedSeconds, 3) + ": " + event_msg;
+  Serial.println(logMessage);
+
+  File logFile = SD.open(LOG_FILENAME, FILE_WRITE);
+  if (logFile) {
+    logFile.println(logMessage);
+    logFile.close();
+  } else {
+    Serial.println("Error: Could not open log file");
+  }
+}
+
+// カメラエラー表示
+void printError(enum CamErr err) {
+  Serial.print("Camera error: ");
+  switch (err) {
+    case CAM_ERR_NO_DEVICE:           Serial.println("No device"); break;
+    case CAM_ERR_ILLEGAL_DEVERR:      Serial.println("Illegal device error"); break;
+    case CAM_ERR_ALREADY_INITIALIZED:  Serial.println("Already initialized"); break;
+    case CAM_ERR_NOT_INITIALIZED:      Serial.println("Not initialized"); break;
+    case CAM_ERR_NOT_STILL_INITIALIZED:Serial.println("Still image not initialized"); break;
+    case CAM_ERR_CANT_CREATE_THREAD:   Serial.println("Failed to create thread"); break;
+    case CAM_ERR_INVALID_PARAM:        Serial.println("Invalid parameter"); break;
+    case CAM_ERR_NO_MEMORY:           Serial.println("Out of memory"); break;
+    case CAM_ERR_USR_INUSED:          Serial.println("Buffer already in use"); break;
+    case CAM_ERR_NOT_PERMITTED:       Serial.println("Operation not permitted"); break;
+    default:                          Serial.println("Unknown camera error"); break;
+  }
+}
+
+// エラー時にLEDを点滅して停止
+void errorLoop(int num) {
+  while (1) {
+    for (int i = 0; i < num; i++) {
+      digitalWrite(LED3, HIGH);
+      delay(300);
+      digitalWrite(LED3, LOW);
+      delay(300);
+    }
+    delay(1000);
+  }
+}
+
+// ループ動作中のLED点滅
+static void Led_isActive() {
+  static int state = 1;
+  if (state == 1) {
+    ledOn(PIN_LED0);
+    state = 0;
+  } else {
+    ledOff(PIN_LED0);
+    state = 1;
+  }
+}
+
+// GNSS位置Fix時のLED制御
+static void Led_isPosfix(bool state) {
+  if (state) {
+    ledOn(PIN_LED1);
+  } else {
+    ledOff(PIN_LED1);
+  }
+}
+
+// エラー時LED制御
+static void Led_isError(bool state) {
+  if (state) {
+    ledOn(PIN_LED3);
+  } else {
+    ledOff(PIN_LED3);
+  }
+}
+
+// GNSS位置情報の表示
+static void print_pos(SpNavData *pNavData) {
+  char StringBuffer[STRING_BUFFER_SIZE];
+
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "%04d/%02d/%02d ",
+           pNavData->time.year, pNavData->time.month, pNavData->time.day);
+  Serial.print(StringBuffer);
+
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "%02d:%02d:%02d.%06ld, ",
+           pNavData->time.hour, pNavData->time.minute, pNavData->time.sec, pNavData->time.usec);
+  Serial.print(StringBuffer);
+
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "numSat:%2d, ",
+           pNavData->numSatellites);
+  Serial.print(StringBuffer);
+
+  if (pNavData->posFixMode == FixInvalid) {
+    Serial.print("No-Fix, ");
+  } else {
+    Serial.print("Fix, ");
+  }
+  if (pNavData->posDataExist == 0) {
+    Serial.print("No Position");
+  } else {
+    Serial.print("Lat=");
+    Serial.print(pNavData->latitude, 6);
+    Serial.print(", Lon=");
+    Serial.print(pNavData->longitude, 6);
+  }
+
+  Serial.println("");
+}
+
+// 衛星情報などの表示
+static void print_condition(SpNavData *pNavData) {
+  char StringBuffer[STRING_BUFFER_SIZE];
+  unsigned long cnt;
+
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "numSatellites:%2d\n", pNavData->numSatellites);
+  Serial.print(StringBuffer);
+
+  for (cnt = 0; cnt < pNavData->numSatellites; cnt++) {
+    const char *pType = "---";
+    SpSatelliteType sattype = pNavData->getSatelliteType(cnt);
+
+    switch (sattype) {
+      case GPS:       pType = "GPS";  break;
+      case GLONASS:   pType = "GLN";  break;
+      case QZ_L1CA:   pType = "QCA";  break;
+      case SBAS:      pType = "SBA";  break;
+      case QZ_L1S:    pType = "Q1S";  break;
+      case BEIDOU:    pType = "BDS";  break;
+      case GALILEO:   pType = "GAL";  break;
+      default:        pType = "UKN";  break;
+    }
+
+    unsigned long Id  = pNavData->getSatelliteId(cnt);
+    unsigned long Elv = pNavData->getSatelliteElevation(cnt);
+    unsigned long Azm = pNavData->getSatelliteAzimuth(cnt);
+    float sigLevel    = pNavData->getSatelliteSignalLevel(cnt);
+
+    snprintf(StringBuffer, STRING_BUFFER_SIZE,
+             "[%2ld] Type:%s, Id:%2ld, Elv:%2ld, Azm:%3ld, CN0:", cnt, pType, Id, Elv, Azm);
+    Serial.print(StringBuffer);
+    Serial.println(sigLevel, 6);
+  }
+}
+
+// GNSS再起動
+void restartGNSS() {
+  int error_flag = 0;
+
+  ledOff(PIN_LED0);
+  Led_isPosfix(false);
+
+  if (Gnss.stop() != 0 || Gnss.end() != 0) {
+    Serial.println("Gnss stop/end error!!");
+    error_flag = 1;
+  } else {
+    Serial.println("Gnss stop OK.");
+  }
+
+  if (Gnss.begin() != 0 || Gnss.start(HOT_START) != 0) {
+    Serial.println("Gnss begin/start error!!");
+    error_flag = 1;
+  } else {
+    Serial.println("Gnss restart OK.");
+  }
+
+  if (error_flag == 1) {
+    Led_isError(true);
+    while(1);
+  }
 }
