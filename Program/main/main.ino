@@ -1,12 +1,14 @@
 /***************************************************************
  *  Spresense アドオンボード用 GNSS + BME280 + MPU6050
- *  取得データを SD カードへ直接書き込み（バッファ未使用）
+ *  取得データを SD カードへ直接書き込み（バッファ使用）
+ *  GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
- *  - GNSS: Spresense アドオンボードの GNSS モジュールを使用
- *    -> "GNSS.addon.h" + "GNSS" クラス
- *    -> UART1 (TX: D1, RX: D0)で通信
- *  - センサ: BME280 (I2C), MPU6050 (I2C)
- *  - データは取得のたびに SD カードに即書き込み
+ *  変更点:
+ *    1) 既存ファイルがあれば連番付きファイル名を生成
+ *    2) センサーデータを10回分バッファにため、まとめて書き込む
+ *    3) 書き込みエラーがあった場合はバッファを消さずに保持し、次回以降リトライ
+ *    4) 書き込み完了後にイベントログへ「バッファ10回分を書き込み完了」と記録
+ *    5) bool continueOnError を追加。trueならエラーでも停止せず続行、falseなら停止
  ***************************************************************/
 
 #include <Arduino.h>
@@ -16,96 +18,86 @@
 #include <Adafruit_Sensor.h>     // Adafruitセンサー基底クラス
 #include <Adafruit_BME280.h>     // BME280センサ制御クラス
 #include <MPU6050.h>             // MPU6050制御クラス
-#include <GNSS.addon.h>          // Spresenseアドオンボード用のGNSSライブラリ
+#include <GNSS.h>                // Spresense Add-on用 GNSSライブラリ (SpGnssAddon)
 
-//==============================================================
-// 定義・定数
-//==============================================================
+//======================================================================
+// ★ エラー発生時に停止するかどうかのフラグ
+//======================================================================
+bool continueOnError = true; // true: エラーでも止まらず続行 / false: エラー時に停止
 
-// ファイル名の定義（拡張子含む）
-#define CSV_BASE_FILENAME "sensor_data"
-#define CSV_EXTENSION ".csv"
-#define LOG_BASE_FILENAME "event_log"
-#define LOG_EXTENSION ".txt"
+//======================================================================
+// ファイル名関連定数
+//======================================================================
+#define CSV_BASE     "sensor_data"   
+#define CSV_EXT      ".csv"
+#define LOG_BASE     "event_log"     
+#define LOG_EXT      ".txt"
 
-// LEDピンの定義
+//======================================================================
+// LEDピン定義
+//======================================================================
 #define PIN_LED0 2 // 動作インジケータLED (アクティブLED)
 #define PIN_LED1 3 // GNSSがFixしたかどうかを示すLED
 #define PIN_LED3 4 // エラー表示用LED
 
+//======================================================================
 // センサー更新インターバル（ミリ秒）
-#define BME280_INTERVAL 50         // 50msごとにBME280を取得
-#define MPU6050_INTERVAL 50        // 50msごとにMPU6050を取得
-#define SERIAL_PRINT_INTERVAL 1000 // 1秒間隔でシリアル出力
+//======================================================================
+#define BME280_INTERVAL       50     // 50msごとにBME280を取得
+#define MPU6050_INTERVAL      50     // 50msごとにMPU6050を取得
+#define SERIAL_PRINT_INTERVAL 1000   // 1秒間隔でシリアル出力
 
-// GNSS通信ポート設定（SpresenseアドオンボードはUART1を利用）
-#define SerialGNSS Serial1  // TX: D1, RX: D0
+// GNSS再起動サイクル (任意)
+#define RESTART_CYCLE (60 * 5)       // 例: 5分(300秒)
 
-//==============================================================
+//======================================================================
+// まとめ書き込み時に使用するバッファ設定
+//======================================================================
+#define BATCH_SIZE 10   // 10回分のセンサーデータをまとめて書き込み
+
+//======================================================================
 // グローバル変数
-//==============================================================
-
-// ----- タイミング制御用 -----
+//======================================================================
 unsigned long previousBme280Millis = 0;
 unsigned long previousMpu6050Millis = 0;
 unsigned long previousSerialMillis = 0;
+unsigned long startTime = 0;
 
-// ----- SDカード関連 -----
-SDClass SD;          // SDカード制御用クラスのインスタンス
-File myFile;         // 書き込みや読み込みに使うFileオブジェクト
+static int LoopCount = 0;
 
-// ----- GNSS関連 (アドオンボード) -----
-/*
-  GNSSクラス:
-   - SpresenseアドオンボードのGNSS機能を制御するためのクラス
-   - UART通信でNMEAなどを受信し、位置情報や衛星情報を取得する
- */
-GNSS Gnss;
+SDClass SD;
+String csvFilename;   // 実際に使用するCSVファイル名
+String logFilename;   // 実際に使用するLOGファイル名
 
-// ----- BME280センサ関連 -----
-/*
-  Adafruit_BME280クラス:
-   - BME280(温度・湿度・気圧)を制御するAdafruit製ライブラリのクラス
-   - begin() で初期化、readTemperature() 等でセンサ値を読み取る
- */
+// GNSS, BME280, MPU6050
+SpGnssAddon Gnss;
 Adafruit_BME280 bme;
-
-// ----- MPU6050センサ関連 -----
-/*
-  MPU6050クラス:
-   - MPU6050(6軸加速度+ジャイロ)を制御するライブラリクラス
-   - initialize()で初期化、getMotion6()等で加速度・ジャイロ値を取得
- */
 MPU6050 mpu;
 
-// ----- GNSSから取得した最新データを入れる構造体 -----
-/*
-  GNSSLocation:
-   - Gnss.read()後にGnss.getLocation()で得られる位置情報を保持
-   - latitude, longitude, altitude, fix, satellitesなどを持つ
- */
-GNSSLocation gnssData;
+// GNSSデータ構造体
+SpNavData gnssData;  
 
-// ----- その他 -----
-unsigned long startTime = 0;      // 起動時刻(ミリ秒)を格納
-char currentCSVFilename[32] = {0}; // CSVファイル名
-char currentLOGFilename[32] = {0}; // ログファイル名
+//======================================================================
+// 10回分の行データを保持するバッファ
+//======================================================================
+static String csvBuffer[BATCH_SIZE]; 
+static int batchIndex = 0; // バッファ内にいくつ溜まっているか
 
-//==============================================================
-// 関数プロトタイプ宣言
-//==============================================================
-
-// 初期化関連
+//======================================================================
+// 関数プロトタイプ
+//======================================================================
+int getNextFileIndex(); // CSV/LOGファイルの連番を決定
 void initGNSS();
+void restartGNSS();
 void initBME280();
 void initMPU6050();
-void initCSV();
-
-// センサー読み取り & SDカード書き込み
+void initSDandCSV();
 void readAndLogSensors();
+void flushCsvBuffer();  // バッファ内容をまとめてファイル書き込み
 
-// ログ・エラー処理
+// エラーハンドリング
 void event(String event_msg);
+void handleError(int errCode);
 void errorLoop(int num);
 
 // LED制御
@@ -113,184 +105,232 @@ void Led_isActive();
 void Led_isPosfix(bool state);
 void Led_isError(bool state);
 
-// デバッグ出力用
 void printSensorDataToSerial(
   float time_s,
   float temperature, float humidity, float pressure,
   float latitude, float longitude, float altitude,
-  int fix, int satellites,
+  bool fix, int satellites,
   float accelX, float accelY, float accelZ,
   float gyroX, float gyroY, float gyroZ
 );
 
-//==============================================================
+//======================================================================
 // setup()
-//==============================================================
+//======================================================================
 void setup() {
-  // シリアルモニタ初期化
   Serial.begin(115200);
-  while (!Serial) {
-    // シリアルの初期化待ち（USB接続環境で有効）
-  }
+  while (!Serial);
 
-  // LEDピンの初期化
   pinMode(PIN_LED0, OUTPUT);
   pinMode(PIN_LED1, OUTPUT);
   pinMode(PIN_LED3, OUTPUT);
-
-  // I2C開始
   Wire.begin();
 
-  // 起動時刻を記録
   startTime = millis();
 
-  // GNSS / BME280 / MPU6050初期化
+  // 初期化処理
   initGNSS();
   initBME280();
   initMPU6050();
+  initSDandCSV();
 
-  // SDカード初期化
-  if (!SD.begin()) {
-    Serial.println("Error: SD card initialization failed.");
-    errorLoop(1);
-  }
-
-  // CSVファイルの作成 & ヘッダー書き込み
-  initCSV();
-
-  // ログに初期化完了の記録
-  event("All initialization completed");
+  event("All initialization completed.");
 }
 
-//==============================================================
+//======================================================================
 // loop()
-//==============================================================
+//======================================================================
 void loop() {
   unsigned long currentMillis = millis();
 
-  // LED点滅: ループが動いていることを示す
+  // LED点滅(ループ動作インジケータ)
   Led_isActive();
 
-  // 1) GNSS更新
-  //    アドオンボード用 GNSSライブラリは Gnss.read() でデータを読み込み
-  //    戻り値 trueなら新しいデータを受信 → gnssDataに反映
-  if (Gnss.read()) {
-    gnssData = Gnss.getLocation();
-    // FixしていればLED点灯
-    Led_isPosfix(gnssData.fix);
+  // GNSSデータを非ブロッキングで更新チェック
+  if (Gnss.waitUpdate(0)) {
+    Gnss.getNavData(&gnssData);
+    bool fixState = (gnssData.posDataExist && (gnssData.posFixMode != FixInvalid));
+    Led_isPosfix(fixState);
   }
 
-  // 2) BME280更新タイミング
+  // センサー取得タイミングチェック
   if (currentMillis - previousBme280Millis >= BME280_INTERVAL) {
     previousBme280Millis = currentMillis;
-    // 実際の読み取りは後段の readAndLogSensors() で行う
   }
-
-  // 3) MPU6050更新タイミング
   if (currentMillis - previousMpu6050Millis >= MPU6050_INTERVAL) {
     previousMpu6050Millis = currentMillis;
   }
 
-  // 4) センサーを読み取り、SDに記録（バッファを使わず直接書き込み）
+  // センサー読み取り & バッファ追記
   readAndLogSensors();
 
-  // 5) 一定間隔でシリアル出力 (1秒おき)
+  // シリアル出力タイミング (例: 1秒おき)
   if (currentMillis - previousSerialMillis >= SERIAL_PRINT_INTERVAL) {
     previousSerialMillis = currentMillis;
-    // 必要に応じてシリアル出力を追加
-    // この例では readAndLogSensors() の中でセンサーデータを
-    // すでにシリアル出力しているので、ここでは特に何もしない
+    // 今回は readAndLogSensors() 内ですでにシリアル出力済み
+  }
+
+  // GNSS再起動(任意)
+  LoopCount++;
+  // ※ 不要ならコメントアウト
+}
+
+//======================================================================
+// CSV/LOGファイル共通の連番を探し、両方存在しないindexを返す
+//======================================================================
+int getNextFileIndex() {
+  int idx = 0;
+  while (true) {
+    String csvCandidate;
+    String logCandidate;
+    if (idx == 0) {
+      csvCandidate = String(CSV_BASE) + String(CSV_EXT);
+      logCandidate = String(LOG_BASE) + String(LOG_EXT);
+    } else {
+      csvCandidate = String(CSV_BASE) + String(idx) + String(CSV_EXT);
+      logCandidate = String(LOG_BASE) + String(idx) + String(LOG_EXT);
+    }
+
+    bool csvExist = SD.exists(csvCandidate);
+    bool logExist = SD.exists(logCandidate);
+    if (!csvExist && !logExist) {
+      // どちらも存在しなければこれを使う
+      return idx;
+    }
+    idx++;
   }
 }
 
-//==============================================================
-// GNSS初期化 (アドオンボード用)
-//==============================================================
+//======================================================================
+// GNSS初期化
+//======================================================================
 void initGNSS() {
-  // UART1設定
-  SerialGNSS.begin(115200);
-  delay(100);
-
-  // GNSSライブラリ初期化
-  // -> GNSSモジュールとの通信開始
-  if (!Gnss.begin(SerialGNSS)) {
-    Serial.println("Error: GNSS initialization failed.");
-    errorLoop(5);
+  int result = Gnss.begin();
+  if (result != 0) {
+    Serial.println("Error: Gnss begin error!!");
+    handleError(5);
   }
 
+  result = Gnss.start();
+  if (result != 0) {
+    Serial.println("Error: Gnss start error!!");
+    handleError(5);
+  }
+
+  Gnss.setInterval(SpInterval_1Hz);
   Serial.println("GNSS setup OK");
 }
 
-//==============================================================
-// BME280初期化
-//==============================================================
-void initBME280() {
-  // BME280をI2Cアドレス0x76で開始
-  if (!bme.begin(0x76)) {
-    Serial.println("Could not find a valid BME280 sensor!");
-    errorLoop(3);
+//======================================================================
+// GNSS再起動 (任意機能)
+//======================================================================
+void restartGNSS() {
+  Serial.println("Restarting GNSS...");
+  if (Gnss.stop() != 0) {
+    Serial.println("Gnss stop error!!");
+    Led_isError(true);
+    return;
   }
+  if (Gnss.end() != 0) {
+    Serial.println("Gnss end error!!");
+    Led_isError(true);
+    return;
+  }
+  if (Gnss.begin() != 0) {
+    Serial.println("Gnss begin error!!");
+    Led_isError(true);
+    return;
+  }
+  if (Gnss.start() != 0) {
+    Serial.println("Gnss start error!!");
+    Led_isError(true);
+    return;
+  }
+  // 例: 10Hzに変更
+  Gnss.setInterval(SpInterval_10Hz);
+
+  Serial.println("Gnss restart OK.");
 }
 
-//==============================================================
+//======================================================================
+// BME280初期化
+//======================================================================
+void initBME280() {
+  if (!bme.begin(0x76)) {
+    Serial.println("Could not find a valid BME280 sensor!");
+    handleError(3);
+  }
+  Serial.println("BME280 setup OK");
+}
+
+//======================================================================
 // MPU6050初期化
-//==============================================================
+//======================================================================
 void initMPU6050() {
   mpu.initialize();
   if (!mpu.testConnection()) {
     Serial.println("MPU6050 connection failed");
-    errorLoop(4);
+    handleError(4);
   }
+  Serial.println("MPU6050 setup OK");
 }
 
-//==============================================================
-// CSVファイル作成 & ヘッダー書き込み
-//==============================================================
-void initCSV() {
-  // シンプルに固定ファイル名として生成
-  snprintf(currentCSVFilename, sizeof(currentCSVFilename), "%s%s", CSV_BASE_FILENAME, CSV_EXTENSION);
-  snprintf(currentLOGFilename, sizeof(currentLOGFilename), "%s%s", LOG_BASE_FILENAME, LOG_EXTENSION);
+//======================================================================
+// SDカード初期化 & CSV/LOGファイル作成
+//======================================================================
+void initSDandCSV() {
+  if (!SD.begin()) {
+    Serial.println("Error: SD card initialization failed.");
+    handleError(1);
+  }
+  Serial.println("SD card setup OK");
 
-  // CSVファイルを作成し、ヘッダを書き込む
-  File csvFile = SD.open(currentCSVFilename, FILE_WRITE);
+  int index = getNextFileIndex();
+  if (index == 0) {
+    csvFilename = String(CSV_BASE) + String(CSV_EXT);
+    logFilename = String(LOG_BASE) + String(LOG_EXT);
+  } else {
+    csvFilename = String(CSV_BASE) + String(index) + String(CSV_EXT);
+    logFilename = String(LOG_BASE) + String(index) + String(LOG_EXT);
+  }
+
+  // CSVファイルを作成しヘッダを追加
+  File csvFile = SD.open(csvFilename, FILE_WRITE);
   if (csvFile) {
-    // CSVのヘッダ行
     csvFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s");
     csvFile.close();
     Serial.print("Logging to: ");
-    Serial.println(currentCSVFilename);
+    Serial.println(csvFilename);
   } else {
     Serial.println("Error: Could not create CSV file");
-    errorLoop(2);
+    handleError(2);
   }
 
-  // ログファイルも作成
-  File logFile = SD.open(currentLOGFilename, FILE_WRITE);
+  // ログファイル作成
+  File logFile = SD.open(logFilename, FILE_WRITE);
   if (logFile) {
-    // ログファイルにもヘッダを入れる（必要に応じて）
-    logFile.println("Time_s: Event");
+    logFile.println("Time_s:Event");
     logFile.close();
     Serial.print("Logging events to: ");
-    Serial.println(currentLOGFilename);
+    Serial.println(logFilename);
   } else {
-    Serial.println("Error: Could not create log file");
-    errorLoop(2);
+    Serial.println("Error: Could not create LOG file");
+    handleError(2);
   }
 }
 
-//==============================================================
-// センサー読み取り → SDカードへ直接書き込み
-//==============================================================
+//======================================================================
+// センサー読み取り & バッファ格納
+//======================================================================
 void readAndLogSensors() {
-  // 経過時間（秒）
   float nowSec = (millis() - startTime) / 1000.0;
 
-  // 1) BME280データ取得
-  float temperature = bme.readTemperature();      // 温度 (℃)
-  float humidity    = bme.readHumidity();         // 湿度 (%)
-  float pressure    = bme.readPressure() / 100.0; // 気圧 (hPa)
+  // BME280
+  float temperature = bme.readTemperature();
+  float humidity    = bme.readHumidity();
+  float pressure    = bme.readPressure() / 100.0;
 
-  // 2) MPU6050データ取得
+  // MPU6050
   int16_t ax, ay, az, gx, gy, gz;
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
   float accelX = ax / 16384.0;
@@ -300,39 +340,50 @@ void readAndLogSensors() {
   float gyroY  = gy / 131.0;
   float gyroZ  = gz / 131.0;
 
-  // 3) GNSSデータ取得 (Gnss.read()はloop内で実行済み)
-  float latitude   = gnssData.latitude;
-  float longitude  = gnssData.longitude;
-  float altitude   = gnssData.altitude;
-  int fix          = gnssData.fix;        // true/false
-  int satellites   = gnssData.satellites; // 衛星数
+  // GNSS
+  bool fix = (gnssData.posDataExist && (gnssData.posFixMode != FixInvalid));
+  float latitude  = gnssData.latitude;
+  float longitude = gnssData.longitude;
+  float altitude  = gnssData.altitude;
+  int satellites  = gnssData.numSatellites;
 
-  // 4) CSVファイルを開いて書き込み
-  File csvFile = SD.open(currentCSVFilename, FILE_WRITE);
-  if (csvFile) {
-    csvFile.print(nowSec, 3);      csvFile.print(",");
-    csvFile.print(temperature, 2); csvFile.print(",");
-    csvFile.print(humidity, 2);    csvFile.print(",");
-    csvFile.print(pressure, 2);    csvFile.print(",");
-    csvFile.print(latitude, 6);    csvFile.print(",");
-    csvFile.print(longitude, 6);   csvFile.print(",");
-    csvFile.print(altitude, 2);    csvFile.print(",");
-    csvFile.print(fix);            csvFile.print(",");
-    csvFile.print(satellites);     csvFile.print(",");
-    csvFile.print(accelX, 4);      csvFile.print(",");
-    csvFile.print(accelY, 4);      csvFile.print(",");
-    csvFile.print(accelZ, 4);      csvFile.print(",");
-    csvFile.print(gyroX, 4);       csvFile.print(",");
-    csvFile.print(gyroY, 4);       csvFile.print(",");
-    csvFile.println(gyroZ, 4);     // printlnで行末
+  // CSV行の文字列を作成
+  // （修正）(fix ? "1" : "0") と "," のようなリテラル同士は + できないので分割
+  String line;
+  line += String(nowSec, 3);       line += ",";
+  line += String(temperature, 2); line += ",";
+  line += String(humidity, 2);    line += ",";
+  line += String(pressure, 2);    line += ",";
+  line += String(latitude, 6);    line += ",";
+  line += String(longitude, 6);   line += ",";
+  line += String(altitude, 2);    line += ",";
 
-    csvFile.close();
+  // fix (true/false) を "1"/"0" にして後ろに "," を追加
+  line += (fix ? "1" : "0");
+  line += ",";
+
+  line += String(satellites);     line += ",";
+  line += String(accelX, 4);      line += ",";
+  line += String(accelY, 4);      line += ",";
+  line += String(accelZ, 4);      line += ",";
+  line += String(gyroX, 4);       line += ",";
+  line += String(gyroY, 4);       line += ",";
+  line += String(gyroZ, 4);
+
+  // バッファに追加
+  if (batchIndex < BATCH_SIZE) {
+    csvBuffer[batchIndex] = line;
+    batchIndex++;
   } else {
-    Serial.println("Error: Could not open CSV file for writing");
-    // 必要に応じてエラー処理
+    Serial.println("Warning: CSV buffer is full, discarding new data");
   }
 
-  // 5) シリアルモニタ表示（確認用）
+  // バッファが10行たまったら書き込みを試みる
+  if (batchIndex >= BATCH_SIZE) {
+    flushCsvBuffer();
+  }
+
+  // シリアル出力 (確認用)
   printSensorDataToSerial(
     nowSec,
     temperature, humidity, pressure,
@@ -343,30 +394,70 @@ void readAndLogSensors() {
   );
 }
 
-//==============================================================
-// イベントログ出力
-//==============================================================
+//======================================================================
+// バッファをファイルに一括書き込み
+//======================================================================
+void flushCsvBuffer() {
+  // ファイルを追記モードで開く
+  File csvFile = SD.open(csvFilename, FILE_WRITE);
+  if (!csvFile) {
+    Serial.println("Error: Could not open CSV file for writing");
+    handleError(2);
+    return;
+  }
+
+  // バッファ内容を書き込み
+  for (int i = 0; i < batchIndex; i++) {
+    csvFile.println(csvBuffer[i]);
+  }
+  csvFile.close();
+
+  // バッファをクリア
+  batchIndex = 0;
+
+  // 書き込み完了をイベントログに残す
+  String msg = "Flushed " + String(BATCH_SIZE) + " lines to CSV";
+  event(msg);
+}
+
+//======================================================================
+// イベントログ書き込み
+//======================================================================
 void event(String event_msg) {
   float t = (millis() - startTime) / 1000.0;
   String s = String(t, 3) + ": " + event_msg;
   Serial.println(s);
 
-  // ログファイルに追記
-  File lf = SD.open(currentLOGFilename, FILE_WRITE);
+  File lf = SD.open(logFilename, FILE_WRITE);
   if (lf) {
     lf.println(s);
     lf.close();
   } else {
     Serial.println("Error: Could not open log file");
+    handleError(2);
   }
 }
 
-//==============================================================
-// エラー時にLEDを点滅して停止し続ける
-//==============================================================
+//======================================================================
+// エラーハンドリング: continueOnErrorフラグにより停止or継続
+//======================================================================
+void handleError(int errCode) {
+  if (continueOnError) {
+    // エラーLEDを点灯しつつ続行
+    Led_isError(true);
+    Serial.print("Warning: error code=");
+    Serial.println(errCode);
+  } else {
+    // 停止
+    errorLoop(errCode);
+  }
+}
+
+//======================================================================
+// エラー時にLED点滅して停止 (従来のerrorLoop)
+//======================================================================
 void errorLoop(int num) {
-  // 例: num=3 なら、(3回点滅→1秒待ち)を繰り返す
-  while (1) {
+  while (true) {
     for (int i = 0; i < num; i++) {
       digitalWrite(PIN_LED3, HIGH);
       delay(300);
@@ -377,11 +468,9 @@ void errorLoop(int num) {
   }
 }
 
-//==============================================================
+//======================================================================
 // LED制御
-//==============================================================
-
-// ループ動作中: 500msごとにトグル
+//======================================================================
 void Led_isActive() {
   static unsigned long lastToggle = 0;
   static bool state = false;
@@ -393,24 +482,22 @@ void Led_isActive() {
   }
 }
 
-// GNSS Fix状態をLEDで表示: fix==trueならLED点灯
 void Led_isPosfix(bool state) {
   digitalWrite(PIN_LED1, state ? HIGH : LOW);
 }
 
-// エラー時LED: HIGHで点灯
 void Led_isError(bool state) {
   digitalWrite(PIN_LED3, state ? HIGH : LOW);
 }
 
-//==============================================================
-// シリアルモニタ用にセンサーデータを出力 (デバッグ表示)
-//==============================================================
+//======================================================================
+// デバッグ用シリアル出力
+//======================================================================
 void printSensorDataToSerial(
   float time_s,
   float temperature, float humidity, float pressure,
   float latitude, float longitude, float altitude,
-  int fix, int satellites,
+  bool fix, int satellites,
   float accelX, float accelY, float accelZ,
   float gyroX, float gyroY, float gyroZ
 ) {
