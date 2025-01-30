@@ -9,6 +9,13 @@
  *    3) 書き込みエラーがあった場合はバッファを消さずに保持し、次回以降リトライ
  *    4) 書き込み完了後にイベントログへ「バッファ10回分を書き込み完了」と記録
  *    5) bool continueOnError を追加。trueならエラーでも停止せず続行、falseなら停止
+ *
+ *    さらに今回の変更:
+ *    - パラシュート展開のロジック削除
+ *    - MPU6050_INTERVAL を 10ms (100Hz) に変更, BME280は50ms, GNSSは10Hz
+ *    - SDカード書き込みに失敗したら、以後は内蔵Flashに保存する
+ *    - イベントログ (event()) も同様に、SDエラー後はFlashに保存
+ *    - 起動時に Flash をフォーマット (リセット)
  ***************************************************************/
 
 #include <Arduino.h>
@@ -44,10 +51,10 @@ bool continueOnError = true; // true: エラーでも止まらず続行 / false:
 // センサー更新インターバル（ミリ秒）
 //======================================================================
 #define BME280_INTERVAL       50     // 50msごとにBME280を取得
-#define MPU6050_INTERVAL      50     // 50msごとにMPU6050を取得
+#define MPU6050_INTERVAL      10     // 10msごとにMPU6050を取得(100Hz)
 #define SERIAL_PRINT_INTERVAL 1000   // 1秒間隔でシリアル出力
 
-// GNSS再起動サイクル (任意)
+// GNSS再起動サイクル (任意) - 今回は使用しない
 #define RESTART_CYCLE (60 * 5)       // 例: 5分(300秒)
 
 //======================================================================
@@ -83,20 +90,32 @@ SpNavData gnssData;
 static String csvBuffer[BATCH_SIZE]; 
 static int batchIndex = 0; // バッファ内にいくつ溜まっているか
 
+// SDカード書き込みに一度でも失敗したら true
+bool sdErrorHappened = false;
+
+//======================================================================
+// Flash用: 今回は疑似コードで実装
+//======================================================================
+bool flashInitialized = false;
+
 //======================================================================
 // 関数プロトタイプ
 //======================================================================
 int getNextFileIndex(); // CSV/LOGファイルの連番を決定
 void initGNSS();
-void restartGNSS();
+// void restartGNSS(); // 今回は使用しないのでコメントアウト
 void initBME280();
 void initMPU6050();
 void initSDandCSV();
+
+// "SD" 書き込み → エラー発生時は sdErrorHappened = true
 void readAndLogSensors();
-void flushCsvBuffer();  // バッファ内容をまとめてファイル書き込み
+void flushCsvBuffer();
+
+// イベントログ
+void event(String event_msg);
 
 // エラーハンドリング
-void event(String event_msg);
 void handleError(int errCode);
 void errorLoop(int num);
 
@@ -115,6 +134,13 @@ void printSensorDataToSerial(
 );
 
 //======================================================================
+// Flash関連 (疑似コード)
+//======================================================================
+void initFlash();                   // 起動時にフォーマット(初期化)
+bool writeLineToFlash(String line); // 一行追加
+bool writeEventToFlash(String line);// イベントログ追加
+
+//======================================================================
 // setup()
 //======================================================================
 void setup() {
@@ -125,6 +151,9 @@ void setup() {
   pinMode(PIN_LED1, OUTPUT);
   pinMode(PIN_LED3, OUTPUT);
   Wire.begin();
+
+  // 起動時に内蔵Flashをフォーマット(初期化)
+  initFlash();
 
   startTime = millis();
 
@@ -170,9 +199,7 @@ void loop() {
     // 今回は readAndLogSensors() 内ですでにシリアル出力済み
   }
 
-  // GNSS再起動(任意)
-  LoopCount++;
-  // ※ 不要ならコメントアウト
+  // LoopCount++ など任意の処理があれば追加
 }
 
 //======================================================================
@@ -217,12 +244,15 @@ void initGNSS() {
     handleError(5);
   }
 
-  Gnss.setInterval(SpInterval_1Hz);
+  // GNSSを10Hzに設定
+  Gnss.setInterval(SpInterval_10Hz);
+
   Serial.println("GNSS setup OK");
 }
 
+/*
 //======================================================================
-// GNSS再起動 (任意機能)
+// GNSS再起動 (今回は不要なのでコメントアウト)
 //======================================================================
 void restartGNSS() {
   Serial.println("Restarting GNSS...");
@@ -246,11 +276,12 @@ void restartGNSS() {
     Led_isError(true);
     return;
   }
-  // 例: 10Hzに変更
+  // 10Hz
   Gnss.setInterval(SpInterval_10Hz);
 
   Serial.println("Gnss restart OK.");
 }
+*/
 
 //======================================================================
 // BME280初期化
@@ -264,7 +295,7 @@ void initBME280() {
 }
 
 //======================================================================
-// MPU6050初期化
+// MPU6050初期化 (MPU6050_INTERVAL=10msで実行想定)
 //======================================================================
 void initMPU6050() {
   mpu.initialize();
@@ -348,7 +379,6 @@ void readAndLogSensors() {
   int satellites  = gnssData.numSatellites;
 
   // CSV行の文字列を作成
-  // （修正）(fix ? "1" : "0") と "," のようなリテラル同士は + できないので分割
   String line;
   line += String(nowSec, 3);       line += ",";
   line += String(temperature, 2); line += ",";
@@ -358,16 +388,17 @@ void readAndLogSensors() {
   line += String(longitude, 6);   line += ",";
   line += String(altitude, 2);    line += ",";
 
-  // fix (true/false) を "1"/"0" にして後ろに "," を追加
+  // fix (true/false) を "1"/"0"
   line += (fix ? "1" : "0");
   line += ",";
 
-  line += String(satellites);     line += ",";
-  line += String(accelX, 4);      line += ",";
-  line += String(accelY, 4);      line += ",";
-  line += String(accelZ, 4);      line += ",";
-  line += String(gyroX, 4);       line += ",";
-  line += String(gyroY, 4);       line += ",";
+  line += String(satellites);
+  line += ",";
+  line += String(accelX, 4);   line += ",";
+  line += String(accelY, 4);   line += ",";
+  line += String(accelZ, 4);   line += ",";
+  line += String(gyroX, 4);    line += ",";
+  line += String(gyroY, 4);    line += ",";
   line += String(gyroZ, 4);
 
   // バッファに追加
@@ -375,10 +406,11 @@ void readAndLogSensors() {
     csvBuffer[batchIndex] = line;
     batchIndex++;
   } else {
+    // バッファが満タン
     Serial.println("Warning: CSV buffer is full, discarding new data");
   }
 
-  // バッファが10行たまったら書き込みを試みる
+  // バッファが満タンなら書き込み
   if (batchIndex >= BATCH_SIZE) {
     flushCsvBuffer();
   }
@@ -398,15 +430,35 @@ void readAndLogSensors() {
 // バッファをファイルに一括書き込み
 //======================================================================
 void flushCsvBuffer() {
-  // ファイルを追記モードで開く
+  if (sdErrorHappened) {
+    // 既に SDエラーになった → Flashに書き込み
+    // Flashに書き込んでバッファクリア
+    for (int i = 0; i < batchIndex; i++) {
+      // Flashへ書き込み（疑似関数）
+      if (!writeLineToFlash(csvBuffer[i])) {
+        Serial.println("Flash write error!");
+        handleError(9);
+        return;
+      }
+    }
+    batchIndex = 0;
+    // イベントログにもFlashへ書く
+    String msg = "Flushed " + String(BATCH_SIZE) + " lines to FLASH";
+    Serial.println(msg);
+    writeEventToFlash(msg); // Flash上にイベント保存
+    return;
+  }
+
+  // SD書き込みを試みる
   File csvFile = SD.open(csvFilename, FILE_WRITE);
   if (!csvFile) {
     Serial.println("Error: Could not open CSV file for writing");
     handleError(2);
+    // 以後Flashに切り替える
+    sdErrorHappened = true;
     return;
   }
 
-  // バッファ内容を書き込み
   for (int i = 0; i < batchIndex; i++) {
     csvFile.println(csvBuffer[i]);
   }
@@ -428,6 +480,13 @@ void event(String event_msg) {
   String s = String(t, 3) + ": " + event_msg;
   Serial.println(s);
 
+  // SDエラー後はFlashに記録
+  if (sdErrorHappened) {
+    writeEventToFlash(s);
+    return;
+  }
+
+  // SDへ書き込み
   File lf = SD.open(logFilename, FILE_WRITE);
   if (lf) {
     lf.println(s);
@@ -435,6 +494,8 @@ void event(String event_msg) {
   } else {
     Serial.println("Error: Could not open log file");
     handleError(2);
+    // SDエラー発生
+    sdErrorHappened = true;
   }
 }
 
@@ -454,7 +515,7 @@ void handleError(int errCode) {
 }
 
 //======================================================================
-// エラー時にLED点滅して停止 (従来のerrorLoop)
+// エラー時にLED点滅して停止
 //======================================================================
 void errorLoop(int num) {
   while (true) {
@@ -531,4 +592,40 @@ void printSensorDataToSerial(
   Serial.print(gyroZ, 4);
 
   Serial.println();
+}
+
+//======================================================================
+// Flash関連（疑似実装）
+//======================================================================
+
+// 起動時にFlashをフォーマット(全消去)する
+void initFlash() {
+  // ここでは疑似的に「flashInitialized = true」にするのみ
+  // 実際にはLittleFSなどをフォーマットする処理が必要
+  Serial.println("Formatting internal Flash... (Pseudo)");
+  flashInitialized = true;
+  // 例: 
+  //   LittleFS.format(); 
+  //   LittleFS.begin();
+}
+
+bool writeLineToFlash(String line) {
+  if (!flashInitialized) return false;
+
+  // ここでは単にシリアルに出力するのみ
+  // 実際にはLittleFSなどに追記する処理を書く
+  Serial.print("[FLASH] ");
+  Serial.println(line);
+
+  return true;
+}
+
+bool writeEventToFlash(String line) {
+  if (!flashInitialized) return false;
+
+  // イベントログをFlashに記録（疑似）
+  Serial.print("[FLASH EVENT] ");
+  Serial.println(line);
+
+  return true;
 }
