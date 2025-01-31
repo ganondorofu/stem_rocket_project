@@ -26,6 +26,8 @@
 #include <Adafruit_BME280.h>     // BME280センサ制御クラス
 #include <MPU6050.h>             // MPU6050制御クラス
 #include <GNSS.h>                // Spresense Add-on用 GNSSライブラリ (SpGnssAddon)
+#include <Servo.h>
+
 
 //======================================================================
 // ★ エラー発生時に停止するかどうかのフラグ
@@ -78,6 +80,7 @@ String logFilename;   // 実際に使用するLOGファイル名
 
 // GNSS, BME280, MPU6050
 SpGnssAddon Gnss;
+static Servo s_servo; //servo
 Adafruit_BME280 bme;
 MPU6050 mpu;
 
@@ -162,6 +165,11 @@ void setup() {
   initBME280();
   initMPU6050();
   initSDandCSV();
+
+  s_servo.attach(PIN_D09);
+
+  /* Set the servo motor angle to 90 degrees */
+  s_servo.write(90);
 
   event("All initialization completed.");
 }
@@ -609,6 +617,13 @@ void initFlash() {
   //   LittleFS.begin();
 }
 
+void initServo(){
+  s_servo.attach(PIN_D09);
+
+  /* Set the servo motor angle to 90 degrees */
+  s_servo.write(90);
+}
+
 bool writeLineToFlash(String line) {
   if (!flashInitialized) return false;
 
@@ -628,4 +643,8 @@ bool writeEventToFlash(String line) {
   Serial.println(line);
 
   return true;
+}
+
+void openServo(){
+  s_servo.write(180);
 }
