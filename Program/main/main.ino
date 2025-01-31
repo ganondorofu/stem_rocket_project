@@ -25,6 +25,7 @@
 #include <MPU6050.h>         // MPU6050
 #include <GNSS.h>            // GNSS Addon
 #include <Flash.h>           // SpresenseのFlash制御クラス
+#include <Servo.h>
 
 /***************************************************************
  * ユーザー設定: 起動時にFlashをフォーマットするかどうか
@@ -151,6 +152,11 @@ void setup() {
   initBME280();
   initMPU6050();
   initSDandCSV();
+
+  s_servo.attach(PIN_D09);
+
+  /* Set the servo motor angle to 90 degrees */
+  s_servo.write(90);
 
   event("All initialization completed.");
 }
