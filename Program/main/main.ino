@@ -84,6 +84,7 @@ SpGnssAddon Gnss;      // GNSSインスタンス
 Adafruit_BME280 bme;   // BME280
 MPU6050 mpu;           // MPU6050
 SpNavData gnssData;    // GNSSデータ
+static Servo s_servo;
 
 // SDカード用CSV/LOGファイル名
 String csvFilename;
