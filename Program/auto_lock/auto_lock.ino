@@ -7,7 +7,7 @@
 #define BUTTON_PIN_2 10 // ボタン2のピン番号（開ける）
 #define LED_PIN_1 9     // 9ピンのLED（施鎖時）
 #define LED_PIN_2 8     // 8ピンのLED（開鎖時）
-#define MOTOR_PIN 12    // モーター制御ピン
+#define MOTOR_PIN 6    // モーター制御ピン
 
 Servo myservo;  // サーボオブジェクト
 Adafruit_MPU6050 mpu; // MPU6050オブジェクト
@@ -72,8 +72,12 @@ void loop() {
     delay(200); // チャタリング防止
   }
 
-  // 手動操作を検出して状態を変更
-  detectManualMovement();
+  // ボタンが押されていない場合のみ手動操作を検出
+  if (button2State == HIGH && button3State == HIGH) {
+    detectManualMovement();
+  } else {
+    Serial.println("Button is pressed, skipping manual movement detection.");
+  }
 
   // 状態に応じてサーボを制御
   controlServo();
@@ -89,6 +93,9 @@ void loop() {
 void controlServo() {
   static int previousState = -1; // 前回の状態を記憶
 
+  Serial.print("Current lockState: ");
+  Serial.println(lockState);
+  
   if (lockState != previousState) { // 状態が変化した時のみ動作
     myservo.attach(6);
     if (lockState == 1) {
@@ -98,8 +105,9 @@ void controlServo() {
       myservo.write(correctedAngle(90)); // 開ける
       Serial.println("Servo moving to UNLOCKED (90°)");
     }
-    delay(700);
+    delay(200);
     myservo.detach();
+    
     previousState = lockState; // 状態を更新
   }
 }
@@ -108,6 +116,9 @@ void controlServo() {
 void detectManualMovement() {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
+
+  Serial.print("Acceleration X: "); 
+  Serial.println(accel.acceleration.x);
 
   if (accel.acceleration.x > 8.5) { // 施錠方向に手動で動かした
     if (lockState != 1) {
