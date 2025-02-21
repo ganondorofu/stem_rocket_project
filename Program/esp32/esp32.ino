@@ -8,7 +8,7 @@
 #include <HTTPClient.h>
 
 // ------------------------------------------------
-// Wi-Fi設定
+// Wi‑Fi設定
 // ------------------------------------------------
 const char* ssid = "ctc-2g-hin0zr";
 const char* password = "1904affe1d065";
@@ -18,6 +18,12 @@ const char* password = "1904affe1d065";
 // ------------------------------------------------
 const char* duckdns_domain = "yn3143";
 const char* duckdns_token  = "42ead428-1a5e-408a-a5fa-3e491578416f";
+
+// ------------------------------------------------
+// OpenWeather API設定
+// ------------------------------------------------
+const char* openweather_apiKey = "7fb64a2a93949c3706c41ccb4a278aa8";
+const char* openweather_city   = "Nagoya,JP";  // 名古屋市（国コードJP）
 
 // ------------------------------------------------
 // シリアル通信ピン (ESP32)
@@ -44,7 +50,11 @@ String lockState = "UNLOCKED";  // 初期状態: UNLOCKED
 unsigned long lastDuckdnsUpdate = 0;
 const unsigned long DUCKDNS_INTERVAL = 600000UL;  // 10分ごと
 
-// エラー発生フラグ（Wi‑Fi接続失敗など、起動失敗時にtrueとなる）
+// OpenWeather更新用タイマー（例として10分ごとに更新）
+unsigned long lastWeatherUpdate = 0;
+const unsigned long WEATHER_UPDATE_INTERVAL = 600000UL; // 10分ごと
+
+// エラー発生フラグ（Wi‑Fi接続失敗などの場合）
 bool errorOccurred = false;
 
 // ------------------------------------------------
@@ -55,7 +65,6 @@ const char* LOGIN_PASS = "uyan5312";
 
 // ------------------------------------------------
 // 簡易ハッシュ関数 (DJB2方式)
-// 文字列から簡易ハッシュ値を計算する（盗聴リスクが低い用途向け）
 // ------------------------------------------------
 String simpleHash(const char* input) {
   unsigned long hash = 5381;
@@ -79,7 +88,7 @@ String getSha256(const char* input) {
   mbedtls_sha256_update(&ctx, (const unsigned char*)input, strlen(input));
   mbedtls_sha256_finish(&ctx, hash);
   mbedtls_sha256_free(&ctx);
-
+  
   String hashStr;
   for (int i = 0; i < 32; i++) {
     char buf[3];
@@ -92,7 +101,6 @@ const String hashedKey = getSha256("XkyaetE6V-FC");
 
 // ------------------------------------------------
 // エラー発生時に表面LEDを点滅させる関数
-// ※エラー状態の場合、この関数内で無限ループしLEDを500ms間隔でON/OFFします
 // ------------------------------------------------
 void errorBlink() {
   while (true) {
@@ -104,9 +112,101 @@ void errorBlink() {
 }
 
 // ------------------------------------------------
+// OpenWeather APIから名古屋市の天気情報を取得する関数
+// 取得結果はSerialモニタに出力するとともに、LCD表示用内容を生成する
+// ------------------------------------------------
+void updateWeather() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "http://api.openweathermap.org/data/2.5/weather?q=";
+    url += openweather_city;
+    url += "&appid=";
+    url += openweather_apiKey;
+    url += "&units=metric";  // 摂氏表示
+    Serial.println("OpenWeather API URL: " + url);
+    
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.println("OpenWeatherレスポンスコード: " + String(httpCode));
+      Serial.println("OpenWeatherレスポンス:");
+      Serial.println(payload);
+      // 取得した天気情報からLCD表示用内容を生成
+      displayWeatherOnLCD(payload);
+    } else {
+      Serial.println("OpenWeather API取得失敗");
+    }
+    http.end();
+  } else {
+    Serial.println("Wi‑Fi未接続のため、OpenWeather API取得不可");
+  }
+}
+
+// ------------------------------------------------
+// LCD表示用内容生成関数
+// 取得した天気情報(JSON)をパースし、1602 LCD用の2行（各16文字以内）の内容を生成する
+// 玄関前の表示例として、1行目に気温と大まかな天気（短縮表記）、2行目に傘のアドバイスを表示
+// ------------------------------------------------
+void displayWeatherOnLCD(const String &payload) {
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.println("天気情報JSONのパースエラー");
+    return;
+  }
+  
+  // JSONから必要な情報を取得
+  float temperature = doc["main"]["temp"];
+  const char* weatherDesc = doc["weather"][0]["description"];
+  
+  // 天気説明を小文字に変換して判定
+  String desc = String(weatherDesc);
+  desc.toLowerCase();
+  
+  // 短縮天気表記（1行目用）と傘アドバイス（2行目用）を決定
+  String shortWeather;
+  String umbrellaAdvice;
+  
+  if (desc.indexOf("rain") != -1 || desc.indexOf("shower") != -1 || desc.indexOf("drizzle") != -1) {
+    shortWeather = "雨";
+    umbrellaAdvice = "傘持参";
+  }
+  else if (desc.indexOf("clear") != -1 || desc.indexOf("sunny") != -1) {
+    shortWeather = "晴";
+    umbrellaAdvice = "傘不要";
+  }
+  else if (desc.indexOf("cloud") != -1) {
+    shortWeather = "曇";
+    umbrellaAdvice = "傘検討";
+  }
+  else {
+    shortWeather = "?";
+    umbrellaAdvice = "注意";
+  }
+  
+  // 1行目：気温と短縮天気表記（例："23.5C 晴"）
+  String line1 = String(temperature, 1) + "C " + shortWeather;
+  if (line1.length() > 16) {
+    line1 = line1.substring(0, 16);
+  }
+  
+  // 2行目：傘のアドバイス（例："傘持参"）
+  String line2 = umbrellaAdvice;
+  if (line2.length() > 16) {
+    line2 = line2.substring(0, 16);
+  }
+  
+  // LCDに出力する場合は、ここで実際にLCDへの書き込みを行う
+  // 今回は実機がないため、Serial出力で内容を確認
+  Serial.println("----- LCD 表示内容 -----");
+  Serial.println(line1);
+  Serial.println(line2);
+  Serial.println("-------------------------");
+}
+
+// ------------------------------------------------
 // 統合ハンドラ: ログインフォーム表示と施錠/解錠画面表示
-// GETリクエスト時は常にログインフォームを表示し、
-// POSTリクエストでIDとパスワードのハッシュが一致した場合のみ施錠/解錠画面を返す。
 // ------------------------------------------------
 void handleLoginPage() {
   if (server.method() == HTTP_GET) {
@@ -128,7 +228,6 @@ void handleLoginPage() {
     formPage += "<body>\n";
     formPage += "  <div class=\"container\">\n";
     formPage += "    <h1>Login</h1>\n";
-    // 以下、パスワード保存／自動入力に対応するため、name属性およびautocomplete属性を追加
     formPage += "    <form method=\"POST\" action=\"/login\" onsubmit=\"hashPass();\">\n";
     formPage += "      <input name=\"id\" id=\"uid\" placeholder=\"User ID\" autocomplete=\"username\" required>\n";
     formPage += "      <input name=\"password\" id=\"pass\" type=\"password\" placeholder=\"Password\" autocomplete=\"current-password\" required>\n";
@@ -137,7 +236,6 @@ void handleLoginPage() {
     formPage += "    </form>\n";
     formPage += "  </div>\n";
     formPage += "  <script>\n";
-    formPage += "    // クライアント側で簡易ハッシュ (DJB2方式) を計算する関数\n";
     formPage += "    function simpleHash(str) {\n";
     formPage += "      let hash = 5381;\n";
     formPage += "      for (let i = 0; i < str.length; i++) {\n";
@@ -149,7 +247,6 @@ void handleLoginPage() {
     formPage += "      let pass = document.getElementById('pass').value;\n";
     formPage += "      let passH = simpleHash(pass);\n";
     formPage += "      document.getElementById('passHashField').value = passH;\n";
-    // パスワード入力欄をクリアしないようにする（これによりブラウザがパスワード保存／自動入力を行えます）\n";
     formPage += "    }\n";
     formPage += "  </script>\n";
     formPage += "</body>\n";
@@ -240,8 +337,6 @@ void handleLoginPage() {
 
 // ------------------------------------------------
 // APIハンドラ: ロック状態の取得と変更を行う
-// GET: URLパラメータ cmd=getLockState で現在の lockState を返す
-// POST: URLパラメータまたはJSON内に cmd:"setLockState" と key, lock が含まれている場合、ロック状態を変更する
 // ------------------------------------------------
 void handleApi() {
   if (server.method() == HTTP_GET) {
@@ -387,7 +482,12 @@ void setup() {
   Serial.println("HTTPサーバー起動");
 
   updateDuckDNS();
+  // 初回のDuckDNS更新時刻を記録
   lastDuckdnsUpdate = millis();
+  
+  // ※玄関前の表示用に、定期的にOpenWeather APIから天気情報を取得し、LCD表示用内容を生成する
+  updateWeather();
+  lastWeatherUpdate = millis();
 }
 
 // ------------------------------------------------
@@ -406,5 +506,10 @@ void loop() {
   if ((now - lastDuckdnsUpdate) >= DUCKDNS_INTERVAL) {
     updateDuckDNS();
     lastDuckdnsUpdate = now;
+  }
+  // OpenWeather APIの情報取得（指定間隔ごと）
+  if ((now - lastWeatherUpdate) >= WEATHER_UPDATE_INTERVAL) {
+    updateWeather();
+    lastWeatherUpdate = now;
   }
 }
