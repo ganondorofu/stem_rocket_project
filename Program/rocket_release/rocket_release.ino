@@ -4,10 +4,10 @@
  * GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
  * 変更点:
- *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 befot_flight.csv）
+ *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 befor_flight.csv）
  *   2) センサーデータを10回分バッファにため、まとめて書き込む（フライト開始後）
  *   3) 書き込みエラーがあった場合はバッファを保持し、次回以降リトライ
- *   4) 書き込み完了後にイベントログへ記録
+ *   4) 書き込み完了後にイベントログへ書き込み
  *   5) bool continueOnError を追加。trueならエラー発生時も処理続行、falseなら停止
  *   6) パラシュート展開のロジック削除 → 今回は自由落下検知により展開する
  *   7) MPU6050_INTERVAL = 10ms (100Hz), BME280_INTERVAL = 50ms, GNSS = 10Hz
@@ -22,10 +22,10 @@
  *     加速度による自由落下検知としパラシュート展開のトリガーとする。
  *   - また、気圧センサのサンプルで5回連続で気圧が減少して「上昇中」と判定し、
  *     その後5回連続で気圧が上昇した場合、発射から1.5秒以降ならパラシュート展開を行い、
- *     ログにもその展開方法（自由落下検知による展開）を記録する。
- *   - ただし、発射から1.5秒未満で下降が検知された場合は、ログには下降検知と記録するが展開は行わない。
+ *     ログにもその展開方法を記録する。
+ *   - ただし、発射から1.5秒未満で下降が検知された場合は展開は行わない。
  *   - さらに、安全機構として、離陸から3秒経過してもまだ展開されていなければ
- *     自動的に deployParachute() を呼び出す（この関数内で1秒後に実際のログ出力とサーボ動作を行う）。
+ *     自動的に deployParachute() を呼び出す（呼び出された後、1秒待機して実際の展開処理を実施）。
  *
  * ★ フライトピン実装（ピン8,9 使用）は前回実装の通り
  ***************************************************************/
@@ -55,7 +55,7 @@
  * ユーザー設定
  ***************************************************************/
 bool formatFlashOnBoot = false;
-bool continueOnError = true; // エラー発生時、true なら処理続行、false なら停止
+bool continueOnError = true; // エラー発生時、trueなら処理続行、falseなら停止
 
 /***************************************************************
  * ファイル名関連定数
@@ -105,6 +105,9 @@ bool continueOnError = true; // エラー発生時、true なら処理続行、f
 // フライトイベントフラグ
 bool flightStarted = false;
 
+// flightStartTime: フライトピンが切られた時点を記録（離陸開始時刻）
+unsigned long flightStartTime = 0;
+
 /***************************************************************
  * グローバル変数（センサ／ログ）
  ***************************************************************/
@@ -136,19 +139,23 @@ int preFlightAccCount = 0;
 /***************************************************************
  * 追加：パラシュート展開用
  ***************************************************************/
-#define FREEFALL_THRESHOLD 0.6  // g 以下なら自由落下とみなす
+#define FREEFALL_THRESHOLD 0.8  // g 以下なら自由落下とみなす
 bool parachuteDeployed = false;
 bool apexDetected = false;
 uint32_t apexTime = 0;
+// deployPending: パラシュート展開保留状態フラグ、deployStartTime: 展開要求時刻
+bool deployPending = false;
+unsigned long deployStartTime = 0;
+// deployMethod: 展開条件の理由を記録するグローバル変数
+String deployMethod = "";
 
 /***************************************************************
  * 追加：気圧トレンド検出用変数
- *  5回連続の変化で判定するためのカウンタと前回値
  ***************************************************************/
 int consecutivePressureDecrease = 0;
 int consecutivePressureIncrease = 0;
 float lastPressure = 0.0;
-bool ascendingDetected = false;  // 5回連続で気圧が減少して上昇中と判定
+bool ascendingDetected = false;
 
 /***************************************************************
  * 関数プロトタイプ（センサ／ログ関連）
@@ -204,7 +211,7 @@ void CamCB(CamImage img) {
   if (lastFrameTime != 0) {
     uint32_t frameGap = currentTime - lastFrameTime;
     if (frameGap > 100) {
-      Serial.println("注意: 動画が途切れた可能性があります。途切れ時間: " + String(frameGap) + " ms");
+      // デバッグ出力削除
     }
   }
   lastFrameTime = currentTime;
@@ -213,15 +220,6 @@ void CamCB(CamImage img) {
   if (overallElapsed >= TOTAL_DURATION_MS) {
     pAvi->endRecording();
     pAvi->end();
-    Serial.println("最終セグメント（" + String(segmentIndex) + "）保存完了 - 経過時間: " + String(overallElapsed) + " ms");
-    Serial.println("Movie saved");
-    Serial.println(" Movie width:    " + String(pAvi->getWidth()));
-    Serial.println(" Movie height:   " + String(pAvi->getHeight()));
-    Serial.println(" File size (kB): " + String(pAvi->getFileSize()));
-    Serial.println(" Captured Frame: " + String(pAvi->getTotalFrame()));
-    Serial.println(" Duration (sec): " + String(pAvi->getDuration()));
-    Serial.println(" Frame per sec : " + String(pAvi->getFps()));
-    Serial.println(" Max data rate : " + String(pAvi->getMaxDataRate()));
     theCamera.end();
     while (true) {
       digitalWrite(PIN_LED0, HIGH);
@@ -233,7 +231,6 @@ void CamCB(CamImage img) {
   if (segmentElapsed >= SEGMENT_DURATION_MS) {
     pAvi->endRecording();
     pAvi->end();
-    Serial.println("セグメント " + String(segmentIndex) + " 保存完了 - 経過時間: " + String(overallElapsed) + " ms");
     delete pAvi;
     segmentIndex++;
     String newFilename = baseFilename + String(segmentIndex) + ".avi";
@@ -249,30 +246,33 @@ void CamCB(CamImage img) {
   uint32_t encodeEnd = millis();
   uint32_t encodeTime = encodeEnd - encodeStart;
   frameCount++;
-  Serial.println("フレーム " + String(frameCount) + " を記録。エンコード時間: " + String(encodeTime) + " ms");
+  // デバッグ出力削除
 }
 
 /***************************************************************
  * readAndLogSensors() 関数（フライト中用）
- * TotalAccel を計算し、CSV に記録する。
- * さらに、気圧センサからのサンプルを連続して取得し、5回連続の
- * 減少なら「上昇中」、5回連続の増加なら「下降中」と判定する。
- * 上昇状態が検知された後に下降が検知された場合、
- * 発射から1.5秒以降なら deployParachute() を呼び出し、ログに記録する。
- * ただし、発射から1.5秒未満で下降が検知された場合はログには下降検知と記録するが展開は行わない。
- * さらに、安全機構として、離陸から3秒経過してもまだ展開されていなければ
- * 自動的に deployParachute() を呼び出す（deployParachute() 内で1秒後に実際の処理を実施）。
+ * ※ 取得した加速度値は以下の補正を適用する：
+ *     correctedAccelX = - rawAccelZ
+ *     correctedAccelY = rawAccelY
+ *     correctedAccelZ = rawAccelX
  ***************************************************************/
 void readAndLogSensors() {
   float nowSec = (millis() - startTime) / 1000.0f;
   float temperature = bme.readTemperature();
   float humidity    = bme.readHumidity();
-  float pressure    = bme.readPressure() / 100.0f;  // hPa
+  float pressure    = bme.readPressure() / 100.0f;
   int16_t ax, ay, az, gx, gy, gz;
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  float accelX = ax / 16384.0f;
-  float accelY = ay / 16384.0f;
-  float accelZ = az / 16384.0f;
+  
+  // raw加速度値をg単位に変換
+  float rawAccelX = ax / 16384.0f;
+  float rawAccelY = ay / 16384.0f;
+  float rawAccelZ = az / 16384.0f;
+  // 補正：加速度センサーの取り付け方向に合わせる
+  float accelX = -rawAccelZ;
+  float accelY = rawAccelY;
+  float accelZ = rawAccelX;
+  
   float gyroX  = gx / 131.0f;
   float gyroY  = gy / 131.0f;
   float gyroZ  = gz / 131.0f;
@@ -283,7 +283,7 @@ void readAndLogSensors() {
   int satellites  = gnssData.numSatellites;
   float totalAccel = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
   
-  // 気圧トレンドの検出
+  // 気圧トレンド検出
   if (lastPressure == 0.0) {
     lastPressure = pressure;
   } else {
@@ -300,45 +300,43 @@ void readAndLogSensors() {
     ascendingDetected = true;
   }
   if (ascendingDetected && consecutivePressureIncrease >= 5) {
-    // 下降検知：発射から1.5秒以降ならパラシュート展開
     if ((millis() - startTime) >= 1500) {
-      event("下降検知（気圧変化による）");
+      event("下降検知（気圧変化による）条件成立");
+      deployMethod = "気圧変化による";
       deployParachute();
     } else {
       event("下降検知（発射初期段階のためパラシュート未展開）");
     }
   }
   
-  // 加速度による自由落下検知：TotalAccel が閾値以下ならパラシュート展開
   if (!parachuteDeployed && totalAccel < FREEFALL_THRESHOLD) {
-    event("加速度検知: 自由落下と判断 (TotalAccel = " + String(totalAccel, 3) + " g)");
+    event("加速度検知（条件成立）：自由落下と判断");
+    deployMethod = "加速度検知による";
     deployParachute();
   }
   
-  // CSV行作成
   String line;
-  line += String(nowSec, 3);       line += ",";
-  line += String(temperature, 2);  line += ",";
-  line += String(humidity, 2);     line += ",";
-  line += String(pressure, 2);     line += ",";
-  line += String(latitude, 6);     line += ",";
-  line += String(longitude, 6);    line += ",";
-  line += String(altitude, 2);     line += ",";
-  line += (fix ? "1" : "0");       line += ",";
-  line += String(satellites);      line += ",";
-  line += String(accelX, 4);       line += ",";
-  line += String(accelY, 4);       line += ",";
-  line += String(accelZ, 4);       line += ",";
-  line += String(gyroX, 4);        line += ",";
-  line += String(gyroY, 4);        line += ",";
-  line += String(gyroZ, 4);        line += ",";
+  line += String(nowSec, 3) + ",";
+  line += String(temperature, 2) + ",";
+  line += String(humidity, 2) + ",";
+  line += String(pressure, 2) + ",";
+  line += String(latitude, 6) + ",";
+  line += String(longitude, 6) + ",";
+  line += String(altitude, 2) + ",";
+  line += (fix ? "1" : "0");
+  line += ",";
+  line += String(satellites) + ",";
+  line += String(accelX, 4) + ",";
+  line += String(accelY, 4) + ",";
+  line += String(accelZ, 4) + ",";
+  line += String(gyroX, 4) + ",";
+  line += String(gyroY, 4) + ",";
+  line += String(gyroZ, 4) + ",";
   line += String(totalAccel, 3);
   
   if (batchIndex < BATCH_SIZE) {
     csvBuffer[batchIndex] = line;
     batchIndex++;
-  } else {
-    Serial.println("Warning: CSV buffer is full, discarding new data");
   }
   if (batchIndex >= BATCH_SIZE) {
     flushCsvBuffer();
@@ -353,16 +351,18 @@ void readAndLogSensors() {
     totalAccel
   );
   
-  // 安全機構: 離陸から3秒経過してもまだパラシュートが展開されていなければ自動展開
-  if (!parachuteDeployed && (millis() - startTime >= 3000)) {
-    event("安全機構: 離陸から3秒経過したためパラシュート展開");
+  // 安全機構：離陸後の3秒タイマーはフライトピンが切られてから開始するため、
+  // flightStartTime を利用する
+  if (!parachuteDeployed && (millis() - flightStartTime >= 2000)) {
+    event("安全機構条件成立：離陸から3秒経過");
+    deployMethod = "安全機構による";
     deployParachute();
   }
 }
 
 /***************************************************************
  * readAndLogSensorsPreFlight() 関数（フライト前用）
- * TotalAccel を計算し、CSV に記録するとともに、5サンプルごとに平均値をシリアル出力する
+ * ※ 加速度の補正も readAndLogSensors() と同様に適用する
  ***************************************************************/
 void readAndLogSensorsPreFlight() {
   float nowSec = (millis() - startTime) / 1000.0f;
@@ -371,9 +371,14 @@ void readAndLogSensorsPreFlight() {
   float pressure    = bme.readPressure() / 100.0f;
   int16_t ax, ay, az, gx, gy, gz;
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  float accelX = ax / 16384.0f;
-  float accelY = ay / 16384.0f;
-  float accelZ = az / 16384.0f;
+  
+  float rawAccelX = ax / 16384.0f;
+  float rawAccelY = ay / 16384.0f;
+  float rawAccelZ = az / 16384.0f;
+  float accelX = -rawAccelZ;
+  float accelY = rawAccelY;
+  float accelZ = rawAccelX;
+  
   float gyroX  = gx / 131.0f;
   float gyroY  = gy / 131.0f;
   float gyroZ  = gz / 131.0f;
@@ -383,53 +388,48 @@ void readAndLogSensorsPreFlight() {
   float altitude  = gnssData.altitude;
   int satellites  = gnssData.numSatellites;
   float totalAccel = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+  
   String line;
-  line += String(nowSec, 3);       line += ",";
-  line += String(temperature, 2);  line += ",";
-  line += String(humidity, 2);     line += ",";
-  line += String(pressure, 2);     line += ",";
-  line += String(latitude, 6);     line += ",";
-  line += String(longitude, 6);    line += ",";
-  line += String(altitude, 2);     line += ",";
-  line += (fix ? "1" : "0");       line += ",";
-  line += String(satellites);      line += ",";
-  line += String(accelX, 4);       line += ",";
-  line += String(accelY, 4);       line += ",";
-  line += String(accelZ, 4);       line += ",";
-  line += String(gyroX, 4);        line += ",";
-  line += String(gyroY, 4);        line += ",";
-  line += String(gyroZ, 4);        line += ",";
+  line += String(nowSec, 3) + ",";
+  line += String(temperature, 2) + ",";
+  line += String(humidity, 2) + ",";
+  line += String(pressure, 2) + ",";
+  line += String(latitude, 6) + ",";
+  line += String(longitude, 6) + ",";
+  line += String(altitude, 2) + ",";
+  line += (fix ? "1" : "0");
+  line += ",";
+  line += String(satellites) + ",";
+  line += String(accelX, 4) + ",";
+  line += String(accelY, 4) + ",";
+  line += String(accelZ, 4) + ",";
+  line += String(gyroX, 4) + ",";
+  line += String(gyroY, 4) + ",";
+  line += String(gyroZ, 4) + ",";
   line += String(totalAccel, 3);
+  
   if (sdErrorHappened) {
     File flashFile = Flash.open(preFlightFilename, FILE_WRITE);
-    if (!flashFile) {
-      Serial.println("Error: Could not open Flash for pre-flight data");
+    if (flashFile) {
+      flashFile.println(line);
+      flashFile.close();
+    } else {
       handleError(9);
       return;
     }
-    flashFile.println(line);
-    flashFile.close();
   } else {
     File pfFile = SD.open(preFlightFilename, FILE_WRITE);
-    if (!pfFile) {
-      Serial.println("Error: Could not open pre-flight CSV file for writing");
+    if (pfFile) {
+      pfFile.println(line);
+      pfFile.close();
+    } else {
       handleError(2);
       return;
     }
-    pfFile.println(line);
-    pfFile.close();
   }
-  Serial.print("Pre-flight data: ");
-  Serial.println(line);
   preFlightAccSum += totalAccel;
   preFlightAccCount++;
   if (preFlightAccCount >= 5) {
-    float avgAcc = preFlightAccSum / preFlightAccCount;
-    Serial.print("Average Acceleration (pre-flight over ");
-    Serial.print(preFlightAccCount);
-    Serial.print(" samples): ");
-    Serial.print(avgAcc, 3);
-    Serial.println(" g");
     preFlightAccSum = 0;
     preFlightAccCount = 0;
   }
@@ -442,51 +442,52 @@ void flushCsvBuffer() {
   if (batchIndex == 0) return;
   if (sdErrorHappened) {
     File flashFile = Flash.open("sensor_data.csv", FILE_WRITE);
-    if (!flashFile) {
-      Serial.println("Error: Could not open Flash for sensor_data.csv");
+    if (flashFile) {
+      for (int i = 0; i < batchIndex; i++) {
+        flashFile.println(csvBuffer[i]);
+      }
+      flashFile.close();
+      batchIndex = 0;
+    } else {
       handleError(9);
       return;
     }
-    for (int i = 0; i < batchIndex; i++) {
-      flashFile.println(csvBuffer[i]);
-    }
-    flashFile.close();
-    batchIndex = 0;
-    Serial.println("Flushed 10 lines to Flash");
     event("Flushed 10 lines to CSV (Flash)");
     return;
   }
   File csvFile = SD.open(csvFilename, FILE_WRITE);
-  if (!csvFile) {
-    Serial.println("Error: Could not open CSV file for writing");
+  if (csvFile) {
+    for (int i = 0; i < batchIndex; i++) {
+      csvFile.println(csvBuffer[i]);
+    }
+    csvFile.close();
+    batchIndex = 0;
+  } else {
     handleError(2);
     sdErrorHappened = true;
     return;
   }
-  for (int i = 0; i < batchIndex; i++) {
-    csvFile.println(csvBuffer[i]);
-  }
-  csvFile.close();
-  batchIndex = 0;
   event("Flushed 10 lines to CSV (SD)");
 }
 
 /***************************************************************
  * event() 関数
+ * SD/Flashへのログ書き込みのみ実施（デバッグ出力なし）→シリアルモニター出力追加
  ***************************************************************/
 void event(String msg) {
   float t = (millis() - startTime) / 1000.0f;
   String s = String(t, 3) + ": " + msg;
+  // シリアルモニターにも出力
   Serial.println(s);
   if (sdErrorHappened) {
     File f = Flash.open("event.txt", FILE_WRITE);
-    if (!f) {
-      Serial.println("Error: Could not open event.txt in Flash");
+    if (f) {
+      f.println(s);
+      f.close();
+    } else {
       handleError(9);
       return;
     }
-    f.println(s);
-    f.close();
     return;
   }
   File lf = SD.open(logFilename, FILE_WRITE);
@@ -494,7 +495,6 @@ void event(String msg) {
     lf.println(s);
     lf.close();
   } else {
-    Serial.println("Error: Could not open log file");
     handleError(2);
     sdErrorHappened = true;
   }
@@ -502,7 +502,7 @@ void event(String msg) {
 
 /***************************************************************
  * handleError() 関数
- * エラー発生時は、エラーコードに応じたエラー内容を出力し、LEDを点滅させる
+ * エラー発生時は、エラーコードに応じたエラー内容を書き込み、LEDを点滅する
  ***************************************************************/
 void handleError(int errCode) {
   String errDetail;
@@ -531,7 +531,6 @@ void handleError(int errCode) {
   }
   event("Error occurred, code = " + String(errCode) + ": " + errDetail);
   
-  // LEDをエラーコード回数分点滅
   for (int i = 0; i < errCode; i++) {
     digitalWrite(PIN_LED3, HIGH);
     delay(300);
@@ -550,7 +549,6 @@ void handleError(int errCode) {
  ***************************************************************/
 void errorLoop(int errCode, String errMsg) {
   while (true) {
-    Serial.println("Error Code " + String(errCode) + ": " + errMsg);
     for (int i = 0; i < errCode; i++) {
       digitalWrite(PIN_LED3, HIGH);
       delay(300);
@@ -585,6 +583,7 @@ void Led_isError(bool state) {
 
 /***************************************************************
  * printSensorDataToSerial() 関数
+ * センサーデータをシリアルモニターに出力する
  ***************************************************************/
 void printSensorDataToSerial(
   float time_s,
@@ -613,32 +612,31 @@ void printSensorDataToSerial(
   Serial.print(fix);
   Serial.print(", Sats: ");
   Serial.print(satellites);
-  Serial.print(", Accel(g): ");
-  Serial.print(accelX, 4); Serial.print("/");
-  Serial.print(accelY, 4); Serial.print("/");
+  Serial.print(", AccelX: ");
+  Serial.print(accelX, 4);
+  Serial.print(" g, AccelY: ");
+  Serial.print(accelY, 4);
+  Serial.print(" g, AccelZ: ");
   Serial.print(accelZ, 4);
-  Serial.print(", Gyro(deg/s): ");
-  Serial.print(gyroX, 4); Serial.print("/");
-  Serial.print(gyroY, 4); Serial.print("/");
+  Serial.print(" g, GyroX: ");
+  Serial.print(gyroX, 4);
+  Serial.print(" dps, GyroY: ");
+  Serial.print(gyroY, 4);
+  Serial.print(" dps, GyroZ: ");
   Serial.print(gyroZ, 4);
-  Serial.print(", TotalAccel: ");
+  Serial.print(" dps, TotalAccel: ");
   Serial.print(totalAccel, 3);
-  Serial.println();
+  Serial.println(" g");
 }
 
 /***************************************************************
- * deployParachute() 関数
- * パラシュート展開処理を実行する関数
- * ※ 呼ばれてから1秒後にログ出力とサーボ動作を実施する
+ * deployParachute() 関数（非ブロッキング実装）
+ * deployParachute() が呼ばれたら、deployPending フラグを立て、1秒後に実際の処理を実施する。
  ***************************************************************/
 void deployParachute() {
-  if (parachuteDeployed) return; // 重複実行防止
-  parachuteDeployed = true;  // 展開済みとマーク
-  // 1秒待機してから実際の処理を実施
-  delay(1000);
-  event("Parachute deployed via free-fall or safety timer (delayed 1 sec).");
-  // サーボ等によるパラシュート展開処理（例）
-  s_servo.write(0);
+  if (parachuteDeployed || deployPending) return;
+  deployPending = true;
+  deployStartTime = millis();
 }
 
 /***************************************************************
@@ -689,19 +687,12 @@ int getNextPreFlightFileIndex() {
  ***************************************************************/
 void initFlash() {
   if (formatFlashOnBoot) {
-    Serial.println("Formatting internal Flash... (on boot)");
     if (!Flash.format()) {
-      Serial.println("Warning: Flash.format() failed!");
-    } else {
-      Serial.println("Flash format done.");
+      // Flashフォーマット失敗時の処理
     }
-  } else {
-    Serial.println("Skipping Flash format on boot.");
   }
   if (!Flash.begin()) {
-    Serial.println("Warning: Flash.begin() failed!");
-  } else {
-    Serial.println("Flash.begin() success.");
+    // Flash初期化失敗時の処理
   }
   flashInitialized = true;
 }
@@ -712,16 +703,13 @@ void initFlash() {
 void initGNSS() {
   int ret = Gnss.begin();
   if (ret != 0) {
-    Serial.println("Error: Gnss.begin() fail");
     handleError(5);
   }
   Gnss.setInterval(GNSS_RATE);
   ret = Gnss.start();
   if (ret != 0) {
-    Serial.println("Error: Gnss.start() fail");
     handleError(5);
   }
-  Serial.println("GNSS setup OK (10Hz)");
 }
 
 /***************************************************************
@@ -729,10 +717,8 @@ void initGNSS() {
  ***************************************************************/
 void initBME280() {
   if (!bme.begin(0x76)) {
-    Serial.println("Could not find a valid BME280 sensor!");
     handleError(3);
   }
-  Serial.println("BME280 setup OK (50ms)");
 }
 
 /***************************************************************
@@ -741,10 +727,8 @@ void initBME280() {
 void initMPU6050() {
   mpu.initialize();
   if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed");
     handleError(4);
   }
-  Serial.println("MPU6050 setup OK (10ms)");
 }
 
 /***************************************************************
@@ -752,12 +736,10 @@ void initMPU6050() {
  ***************************************************************/
 void initSDandCSV() {
   if (!SD.begin()) {
-    Serial.println("Error: SD card initialization failed.");
     handleError(1);
     sdErrorHappened = true;
     return;
   }
-  Serial.println("SD card setup OK");
   int idx = getNextFileIndex();
   String csvCandidate, logCandidate;
   if (idx == 0) {
@@ -772,10 +754,7 @@ void initSDandCSV() {
     csvFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s,TotalAccel");
     csvFile.close();
     csvFilename = csvCandidate;
-    Serial.print("Logging sensor data to: ");
-    Serial.println(csvFilename);
   } else {
-    Serial.println("Error: Could not create CSV file");
     handleError(2);
     sdErrorHappened = true;
   }
@@ -784,10 +763,7 @@ void initSDandCSV() {
     lf.println("Time_s:Event");
     lf.close();
     logFilename = logCandidate;
-    Serial.print("Logging events to: ");
-    Serial.println(logFilename);
   } else {
-    Serial.println("Error: Could not create LOG file");
     handleError(2);
     sdErrorHappened = true;
   }
@@ -798,7 +774,6 @@ void initSDandCSV() {
  ***************************************************************/
 void initPreFlightCSV() {
   if (!SD.begin()) {
-    Serial.println("Error: SD card initialization failed for pre-flight logging.");
     return;
   }
   int idx = getNextPreFlightFileIndex();
@@ -813,10 +788,7 @@ void initPreFlightCSV() {
     pfFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s,TotalAccel");
     pfFile.close();
     preFlightFilename = candidate;
-    Serial.print("Logging pre-flight sensor data to: ");
-    Serial.println(preFlightFilename);
   } else {
-    Serial.println("Error: Could not create pre-flight CSV file");
     handleError(2);
   }
 }
@@ -827,6 +799,7 @@ void initPreFlightCSV() {
 void setup() {
   Serial.begin(115200);
   while (!Serial);
+  
   pinMode(PIN_LED0, OUTPUT);
   pinMode(PIN_LED1, OUTPUT);
   pinMode(PIN_LED3, OUTPUT);
@@ -854,11 +827,13 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   Led_isActive();
+  
   if (Gnss.waitUpdate(0)) {
     Gnss.getNavData(&gnssData);
     bool fixState = (gnssData.posDataExist && (gnssData.posFixMode != FixInvalid));
     Led_isPosfix(fixState);
   }
+  
   if (!flightStarted) {
     if (currentMillis - previousPreFlightMillis >= PRE_FLIGHT_INTERVAL) {
       previousPreFlightMillis = currentMillis;
@@ -866,6 +841,8 @@ void loop() {
     }
     if (digitalRead(PIN_FLIGHT_INPUT) == HIGH) {
       flightStarted = true;
+      // フライトピンが切られた時点で flightStartTime を記録する
+      flightStartTime = millis();
       event("Flight event detected: Flight pin cut. Starting sensor logging and video recording.");
       String newFilename = baseFilename + String(segmentIndex) + ".avi";
       theSD.remove(newFilename);
@@ -879,14 +856,25 @@ void loop() {
     }
     return;
   }
+  
   if (currentMillis - previousBme280Millis >= BME280_INTERVAL) {
     previousBme280Millis = currentMillis;
   }
   if (currentMillis - previousMpu6050Millis >= MPU6050_INTERVAL) {
     previousMpu6050Millis = currentMillis;
   }
+  
   readAndLogSensors();
+  
   if (currentMillis - previousSerialMillis >= SERIAL_PRINT_INTERVAL) {
     previousSerialMillis = currentMillis;
+  }
+  
+  // deployPending 非ブロッキング展開処理：1秒後に実際の処理を実施
+  if (deployPending && (millis() - deployStartTime >= 1000)) {
+    event("Parachute deployed via " + deployMethod + " (delayed 1 sec).");
+    s_servo.write(0);
+    deployPending = false;
+    parachuteDeployed = true;
   }
 }

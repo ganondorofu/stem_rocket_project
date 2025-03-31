@@ -39,7 +39,6 @@ void CamCB(CamImage img) {
   }
 }
 
-
 void setup() {
   Serial.begin(115200);
   while (!theSD.begin()) { Serial.println("insert SD card"); }
