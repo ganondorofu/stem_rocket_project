@@ -10,7 +10,7 @@ AviLibrary theAvi;
 String filename = "movie.avi";
 
 void CamCB(CamImage img) {
-  const static uint32_t recording_time_in_ms = 10000;  /* msec */
+  const static uint32_t recording_time_in_ms = 600000;  /* msec */ // ここの値を変えると録画時間が変わる
   static uint32_t start_time = millis();
 
   if (img.isAvailable()) {
