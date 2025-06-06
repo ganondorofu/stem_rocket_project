@@ -4,7 +4,7 @@
  * GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
  * 変更点:
- *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 befor_flight.csv）
+*   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 before_flight.csv）
  *   2) センサーデータを10回分バッファにため、まとめて書き込む（フライト開始後）
  *   3) 書き込みエラーがあった場合はバッファを保持し、次回以降リトライ
  *   4) 書き込み完了後にイベントログへ書き込み
@@ -17,7 +17,7 @@
  *
  * ★ 追加変更点: 前段記録（Pre-flight logging）＋加速度測定
  *   - 起動後、フライトピンが切れるまで（ショート状態）の間、1秒間隔でセンサーデータを
- *     "befor_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
+*     "before_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
  *   - フライト中も TotalAccel を記録し、TotalAccel が FREEFALL_THRESHOLD 以下になった場合、
  *     加速度による自由落下検知としパラシュート展開のトリガーとする。
  *   - また、気圧センサのサンプルで5回連続で気圧が減少して「上昇中」と判定し、
@@ -64,7 +64,7 @@ bool continueOnError = true; // エラー発生時、trueなら処理続行、fa
 #define CSV_EXT        ".csv"
 #define LOG_BASE       "event_log"
 #define LOG_EXT        ".txt"
-#define PRE_FLIGHT_BASE "befor_flight"
+#define PRE_FLIGHT_BASE "before_flight"
 #define PRE_FLIGHT_EXT  ".csv"
 
 /***************************************************************
