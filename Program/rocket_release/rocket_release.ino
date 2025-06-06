@@ -50,6 +50,7 @@
 
 // math.h (sqrt用)
 #include <math.h>
+#include "../lib/common.h"
 
 /***************************************************************
  * ユーザー設定
@@ -162,16 +163,11 @@ bool ascendingDetected = false;
  ***************************************************************/
 int  getNextFileIndex();
 int  getNextPreFlightFileIndex();
-void initFlash();
-void initGNSS();
-void initBME280();
-void initMPU6050();
-void initSDandCSV();
-void initPreFlightCSV();
+
 void readAndLogSensors();
 void flushCsvBuffer();
 void readAndLogSensorsPreFlight();
-void event(String msg);
+void logEvent(String msg); // Provided by common library
 void handleError(int errCode);
 void errorLoop(int errCode, String errMsg);
 void deployParachute();
@@ -301,16 +297,16 @@ void readAndLogSensors() {
   }
   if (ascendingDetected && consecutivePressureIncrease >= 5) {
     if ((millis() - startTime) >= 1500) {
-      event("下降検知（気圧変化による）条件成立");
+      logEvent("下降検知（気圧変化による）条件成立");
       deployMethod = "気圧変化による";
       deployParachute();
     } else {
-      event("下降検知（発射初期段階のためパラシュート未展開）");
+      logEvent("下降検知（発射初期段階のためパラシュート未展開）");
     }
   }
   
   if (!parachuteDeployed && totalAccel < FREEFALL_THRESHOLD) {
-    event("加速度検知（条件成立）：自由落下と判断");
+    logEvent("加速度検知（条件成立）：自由落下と判断");
     deployMethod = "加速度検知による";
     deployParachute();
   }
@@ -354,7 +350,7 @@ void readAndLogSensors() {
   // 安全機構：離陸後の3秒タイマーはフライトピンが切られてから開始するため、
   // flightStartTime を利用する
   if (!parachuteDeployed && (millis() - flightStartTime >= 2000)) {
-    event("安全機構条件成立：離陸から3秒経過");
+    logEvent("安全機構条件成立：離陸から3秒経過");
     deployMethod = "安全機構による";
     deployParachute();
   }
@@ -452,7 +448,7 @@ void flushCsvBuffer() {
       handleError(9);
       return;
     }
-    event("Flushed 10 lines to CSV (Flash)");
+    logEvent("Flushed 10 lines to CSV (Flash)");
     return;
   }
   File csvFile = SD.open(csvFilename, FILE_WRITE);
@@ -467,38 +463,9 @@ void flushCsvBuffer() {
     sdErrorHappened = true;
     return;
   }
-  event("Flushed 10 lines to CSV (SD)");
+  logEvent("Flushed 10 lines to CSV (SD)");
 }
 
-/***************************************************************
- * event() 関数
- * SD/Flashへのログ書き込みのみ実施（デバッグ出力なし）→シリアルモニター出力追加
- ***************************************************************/
-void event(String msg) {
-  float t = (millis() - startTime) / 1000.0f;
-  String s = String(t, 3) + ": " + msg;
-  // シリアルモニターにも出力
-  Serial.println(s);
-  if (sdErrorHappened) {
-    File f = Flash.open("event.txt", FILE_WRITE);
-    if (f) {
-      f.println(s);
-      f.close();
-    } else {
-      handleError(9);
-      return;
-    }
-    return;
-  }
-  File lf = SD.open(logFilename, FILE_WRITE);
-  if (lf) {
-    lf.println(s);
-    lf.close();
-  } else {
-    handleError(2);
-    sdErrorHappened = true;
-  }
-}
 
 /***************************************************************
  * handleError() 関数
@@ -529,7 +496,7 @@ void handleError(int errCode) {
       errDetail = "不明なエラー";
       break;
   }
-  event("Error occurred, code = " + String(errCode) + ": " + errDetail);
+  logEvent("Error occurred, code = " + String(errCode) + ": " + errDetail);
   
   for (int i = 0; i < errCode; i++) {
     digitalWrite(PIN_LED3, HIGH);
@@ -682,116 +649,6 @@ int getNextPreFlightFileIndex() {
   }
 }
 
-/***************************************************************
- * initFlash() 関数
- ***************************************************************/
-void initFlash() {
-  if (formatFlashOnBoot) {
-    if (!Flash.format()) {
-      // Flashフォーマット失敗時の処理
-    }
-  }
-  if (!Flash.begin()) {
-    // Flash初期化失敗時の処理
-  }
-  flashInitialized = true;
-}
-
-/***************************************************************
- * initGNSS() 関数
- ***************************************************************/
-void initGNSS() {
-  int ret = Gnss.begin();
-  if (ret != 0) {
-    handleError(5);
-  }
-  Gnss.setInterval(GNSS_RATE);
-  ret = Gnss.start();
-  if (ret != 0) {
-    handleError(5);
-  }
-}
-
-/***************************************************************
- * initBME280() 関数
- ***************************************************************/
-void initBME280() {
-  if (!bme.begin(0x76)) {
-    handleError(3);
-  }
-}
-
-/***************************************************************
- * initMPU6050() 関数
- ***************************************************************/
-void initMPU6050() {
-  mpu.initialize();
-  if (!mpu.testConnection()) {
-    handleError(4);
-  }
-}
-
-/***************************************************************
- * initSDandCSV() 関数
- ***************************************************************/
-void initSDandCSV() {
-  if (!SD.begin()) {
-    handleError(1);
-    sdErrorHappened = true;
-    return;
-  }
-  int idx = getNextFileIndex();
-  String csvCandidate, logCandidate;
-  if (idx == 0) {
-    csvCandidate = String(CSV_BASE) + String(CSV_EXT);
-    logCandidate = String(LOG_BASE) + String(LOG_EXT);
-  } else {
-    csvCandidate = String(CSV_BASE) + String(idx) + String(CSV_EXT);
-    logCandidate = String(LOG_BASE) + String(idx) + String(LOG_EXT);
-  }
-  File csvFile = SD.open(csvCandidate, FILE_WRITE);
-  if (csvFile) {
-    csvFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s,TotalAccel");
-    csvFile.close();
-    csvFilename = csvCandidate;
-  } else {
-    handleError(2);
-    sdErrorHappened = true;
-  }
-  File lf = SD.open(logCandidate, FILE_WRITE);
-  if (lf) {
-    lf.println("Time_s:Event");
-    lf.close();
-    logFilename = logCandidate;
-  } else {
-    handleError(2);
-    sdErrorHappened = true;
-  }
-}
-
-/***************************************************************
- * initPreFlightCSV() 関数
- ***************************************************************/
-void initPreFlightCSV() {
-  if (!SD.begin()) {
-    return;
-  }
-  int idx = getNextPreFlightFileIndex();
-  String candidate;
-  if (idx == 0) {
-    candidate = String(PRE_FLIGHT_BASE) + String(PRE_FLIGHT_EXT);
-  } else {
-    candidate = String(PRE_FLIGHT_BASE) + String(idx) + String(PRE_FLIGHT_EXT);
-  }
-  File pfFile = SD.open(candidate, FILE_WRITE);
-  if (pfFile) {
-    pfFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s,TotalAccel");
-    pfFile.close();
-    preFlightFilename = candidate;
-  } else {
-    handleError(2);
-  }
-}
 
 /***************************************************************
  * setup() 関数
@@ -807,18 +664,20 @@ void setup() {
   pinMode(PIN_FLIGHT_OUTPUT, OUTPUT);
   digitalWrite(PIN_FLIGHT_OUTPUT, LOW);
   pinMode(PIN_FLIGHT_INPUT, INPUT_PULLUP);
-  initFlash();
+  initFlash(formatFlashOnBoot, flashInitialized);
   startTime = millis();
-  initGNSS();
-  initBME280();
-  initMPU6050();
-  initSDandCSV();
-  initPreFlightCSV();
+  initGNSS(Gnss);
+  initBME280(bme);
+  initMPU6050(mpu);
+  initSDandCSV(SD, csvFilename, logFilename, sdErrorHappened,
+               CSV_BASE, CSV_EXT, LOG_BASE, LOG_EXT, handleError);
+  initPreFlightCSV(SD, preFlightFilename, PRE_FLIGHT_BASE, PRE_FLIGHT_EXT,
+                   handleError);
   s_servo.attach(PIN_D12);
   s_servo.write(90);
   const int buff_num = 2;
   theCamera.begin(buff_num, CAM_VIDEO_FPS_60, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V, CAM_IMAGE_PIX_FMT_JPG, 5);
-  event("All initialization completed. Waiting for flight event...");
+  logEvent("All initialization completed. Waiting for flight event...");
 }
 
 /***************************************************************
@@ -843,7 +702,7 @@ void loop() {
       flightStarted = true;
       // フライトピンが切られた時点で flightStartTime を記録する
       flightStartTime = millis();
-      event("Flight event detected: Flight pin cut. Starting sensor logging and video recording.");
+      logEvent("Flight event detected: Flight pin cut. Starting sensor logging and video recording.");
       String newFilename = baseFilename + String(segmentIndex) + ".avi";
       theSD.remove(newFilename);
       aviFile = theSD.open(newFilename, FILE_WRITE);
@@ -872,7 +731,7 @@ void loop() {
   
   // deployPending 非ブロッキング展開処理：1秒後に実際の処理を実施
   if (deployPending && (millis() - deployStartTime >= 1000)) {
-    event("Parachute deployed via " + deployMethod + " (delayed 1 sec).");
+    logEvent("Parachute deployed via " + deployMethod + " (delayed 1 sec).");
     s_servo.write(0);
     deployPending = false;
     parachuteDeployed = true;
