@@ -1,0 +1,10 @@
+# Ignore Arduino build artifacts
+*.elf
+*.hex
+*.bin
+
+# Ignore build directories
+build/
+
+# Ignore log files
+*.log
