@@ -4,7 +4,7 @@
  * GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
  * 変更点:
- *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 befot_flight.csv）
+ *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 before_flight.csv）
  *   2) センサーデータを10回分バッファにため、まとめて書き込む（フライト開始後）
  *   3) 書き込みエラーがあった場合はバッファを保持し、次回以降リトライ
  *   4) 書き込み完了後にイベントログへ記録
@@ -17,7 +17,7 @@
  *
  * ★ 追加変更点: 前段記録（Pre-flight logging）＋加速度測定
  *   - 起動後、フライトピンが切れるまで（ショート状態）の間、1秒間隔でセンサーデータを
- *     "befor_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
+ *     "before_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
  *   - フライト中も TotalAccel を記録し、TotalAccel が FREEFALL_THRESHOLD 以下になった場合、
  *     加速度による自由落下検知としパラシュート展開のトリガーとする。
  *   - また、気圧センサのサンプルで5回連続で気圧が減少して「上昇中」と判定し、
@@ -39,7 +39,6 @@
 #include <MPU6050.h>         // MPU6050
 #include <GNSS.h>            // GNSS Addon
 #include <Flash.h>           // SpresenseのFlash制御クラス
-#include <Servo.h>           // サーボ制御
 
 // ★ カメラ・動画関連ライブラリ ★
 #include <Camera.h>          // カメラ制御用ライブラリ
@@ -64,7 +63,7 @@ bool continueOnError = true; // エラー発生時、true なら処理続行、f
 #define CSV_EXT        ".csv"
 #define LOG_BASE       "event_log"
 #define LOG_EXT        ".txt"
-#define PRE_FLIGHT_BASE "befor_flight"
+#define PRE_FLIGHT_BASE "before_flight"
 #define PRE_FLIGHT_EXT  ".csv"
 
 /***************************************************************
@@ -118,7 +117,6 @@ SpGnssAddon Gnss;
 Adafruit_BME280 bme;
 MPU6050 mpu;
 SpNavData gnssData;
-static Servo s_servo;
 String csvFilename;
 String logFilename;
 String preFlightFilename;
@@ -138,8 +136,6 @@ int preFlightAccCount = 0;
  ***************************************************************/
 #define FREEFALL_THRESHOLD 0.6  // g 以下なら自由落下とみなす
 bool parachuteDeployed = false;
-bool apexDetected = false;
-uint32_t apexTime = 0;
 
 /***************************************************************
  * 追加：気圧トレンド検出用変数
@@ -634,11 +630,9 @@ void printSensorDataToSerial(
 void deployParachute() {
   if (parachuteDeployed) return; // 重複実行防止
   parachuteDeployed = true;  // 展開済みとマーク
-  // 1秒待機してから実際の処理を実施
+  // 1秒待機してログに記録するだけ
   delay(1000);
-  event("Parachute deployed via free-fall or safety timer (delayed 1 sec).");
-  // サーボ等によるパラシュート展開処理（例）
-  s_servo.write(0);
+  event("Parachute deployment logged via free-fall or safety timer (delayed 1 sec).");
 }
 
 /***************************************************************
@@ -841,8 +835,6 @@ void setup() {
   initMPU6050();
   initSDandCSV();
   initPreFlightCSV();
-  s_servo.attach(PIN_D12);
-  s_servo.write(90);
   const int buff_num = 2;
   theCamera.begin(buff_num, CAM_VIDEO_FPS_60, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V, CAM_IMAGE_PIX_FMT_JPG, 5);
   event("All initialization completed. Waiting for flight event...");
