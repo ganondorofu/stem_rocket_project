@@ -10,6 +10,11 @@
 - 加速度合計 `totalAccel` が `LAUNCH_ACCEL_THRESHOLD` を超えたとき
 
 加速度しきい値は 3.0g に設定されています。
+`LAUNCH_ACCEL_THRESHOLD` 定数を変更することで、この閾値を調整できます。
+
+離陸が検知されると `startFlight()` が呼び出され、`flightStartTime` を記録
+して前段記録のバッファをフラッシュし、その後通常のログ記録と動画撮影を開始します。
+
 
 前段記録データは `before_flight.csv` に保存されます。
 

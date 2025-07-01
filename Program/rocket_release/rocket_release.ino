@@ -173,6 +173,7 @@ uint32_t lastFrameTime = 0;
 /***************************************************************
  * 追加：パラシュート展開用
  ***************************************************************/
+
 #define FREEFALL_THRESHOLD 0.8  // g 以下なら自由落下とみなす
 // 加速度による離陸検知用しきい値
 #define LAUNCH_ACCEL_THRESHOLD 3.0  // g 超なら離陸と判定
@@ -222,7 +223,6 @@ void printSensorDataToSerial(
 );
 
 /***************************************************************
-
  * recordPreFlightSensorData()
  * 前段記録用にセンサーデータを取得し、循環バッファに保存する関数
  * 古い（10秒以上前の）データは自動的に削除
@@ -526,6 +526,26 @@ void flushCsvBuffer() {
     return;
   }
   event("Flushed 50 lines to CSV (SD)");
+}
+
+/***************************************************************
+ * flushPreFlightBuffer() 関数
+ * 前段記録ファイルを明示的にフラッシュする
+ ***************************************************************/
+void flushPreFlightBuffer() {
+  if (sdErrorHappened) {
+    File flashFile = Flash.open(preFlightFilename, FILE_WRITE);
+    if (flashFile) {
+      flashFile.flush();
+      flashFile.close();
+    }
+    return;
+  }
+  File pfFile = SD.open(preFlightFilename, FILE_WRITE);
+  if (pfFile) {
+    pfFile.flush();
+    pfFile.close();
+  }
 }
 
 /***************************************************************
