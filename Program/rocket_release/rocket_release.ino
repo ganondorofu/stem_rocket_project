@@ -27,7 +27,7 @@
  *   - さらに、安全機構として、離陸から3秒経過してもまだ展開されていなければ
  *     自動的に deployParachute() を呼び出す（呼び出された後、1秒待機して実際の展開処理を実施）。
  *
- * ★ フライトピン実装（ピン8,9 使用）は前回実装の通り
+ * ★ フライトピン実装（ピン8,9 使用）は従来通りです。
  ***************************************************************/
 
 #include <Arduino.h>
@@ -105,12 +105,19 @@ bool useCamera  = true;  // カメラで動画を記録するか
 /***************************************************************
  * バッファ設定（フライト中用）
  ***************************************************************/
-#define BATCH_SIZE 10
+#define BATCH_SIZE 50    // SDアクセス回数削減のためにバッチサイズを50に拡大
 
 /***************************************************************
- * 前段記録用間隔
+ * 前段記録用関連設定
  ***************************************************************/
-#define PRE_FLIGHT_INTERVAL 1000   // 1秒間隔
+#define PREFLIGHT_SENSOR_INTERVAL 50   // pre-flightセンサーデータ取得間隔（50ms）
+#define PREFLIGHT_BUFFER_MAX 200         // 前段記録バッファの最大件数（概ね10秒分）
+unsigned long previousPreFlightSensorMillis = 0;  // 前段記録用タイミング管理
+
+// 前段記録用の循環バッファ（各エントリ：取得時刻とCSV形式データ）
+unsigned long preFlightTimeBuffer[PREFLIGHT_BUFFER_MAX];
+String preFlightDataBuffer[PREFLIGHT_BUFFER_MAX];
+int preFlightBufferCount = 0;
 
 /***************************************************************
  * フライトピン用ピン定義
@@ -122,8 +129,7 @@ bool useCamera  = true;  // カメラで動画を記録するか
 
 // フライトイベントフラグ
 bool flightStarted = false;
-
-// flightStartTime: フライトピンが切られた時点を記録（離陸開始時刻）
+// flightStartTime: フライトピンが切られた時点（離陸開始時刻）
 unsigned long flightStartTime = 0;
 
 /***************************************************************
@@ -132,7 +138,6 @@ unsigned long flightStartTime = 0;
 unsigned long previousBme280Millis = 0;
 unsigned long previousMpu6050Millis = 0;
 unsigned long previousSerialMillis = 0;
-unsigned long previousPreFlightMillis = 0;
 unsigned long startTime = 0;
 SDClass SD;
 SpGnssAddon Gnss;
@@ -148,7 +153,7 @@ bool sdErrorHappened = false;
 bool flashInitialized = false;
 
 /***************************************************************
- * 追加：前段記録中の加速度平均用変数
+ * 追加：前段記録中の加速度平均用変数（そのまま）
  ***************************************************************/
 float preFlightAccSum = 0.0;
 int preFlightAccCount = 0;
@@ -168,7 +173,10 @@ uint32_t lastFrameTime = 0;
 /***************************************************************
  * 追加：パラシュート展開用
  ***************************************************************/
+
+#define FREEFALL_THRESHOLD 0.8  // g 以下なら自由落下とみなす
 // 加速度による離陸検知用しきい値
+#define LAUNCH_ACCEL_THRESHOLD 3.0  // g 超なら離陸と判定
 bool parachuteDeployed = false;
 // deployMethod: 展開条件の理由を記録するグローバル変数
 String deployMethod = "";
@@ -182,7 +190,7 @@ float lastPressure = 0.0;
 bool ascendingDetected = false;
 
 /***************************************************************
- * 関数プロトタイプ（センサ／ログ関連）
+ * センサーデータ構造体定義（高速化のため、1回の取得で全データをまとめて扱う）
  ***************************************************************/
 int  getNextFileIndex();
 int  getNextPreFlightFileIndex();
@@ -215,9 +223,40 @@ void printSensorDataToSerial(
 );
 
 /***************************************************************
+ * recordPreFlightSensorData()
+ * 前段記録用にセンサーデータを取得し、循環バッファに保存する関数
+ * 古い（10秒以上前の）データは自動的に削除
+ ***************************************************************/
+void recordPreFlightSensorData() {
+  SensorData data = getSensorData();
+  String line = sensorDataToCSVLine(data);
+  unsigned long currentMillis = millis();
+  // バッファに追加（空きがあれば末尾に追加、満杯の場合はシフト）
+  if (preFlightBufferCount < PREFLIGHT_BUFFER_MAX) {
+    preFlightTimeBuffer[preFlightBufferCount] = currentMillis;
+    preFlightDataBuffer[preFlightBufferCount] = line;
+    preFlightBufferCount++;
+  } else {
+    for (int i = 1; i < preFlightBufferCount; i++) {
+      preFlightTimeBuffer[i-1] = preFlightTimeBuffer[i];
+      preFlightDataBuffer[i-1] = preFlightDataBuffer[i];
+    }
+    preFlightTimeBuffer[preFlightBufferCount-1] = currentMillis;
+    preFlightDataBuffer[preFlightBufferCount-1] = line;
+  }
+  // 古いデータ（10秒以上前）を削除
+  while (preFlightBufferCount > 0 && (currentMillis - preFlightTimeBuffer[0]) > 10000) {
+    for (int i = 1; i < preFlightBufferCount; i++) {
+      preFlightTimeBuffer[i-1] = preFlightTimeBuffer[i];
+      preFlightDataBuffer[i-1] = preFlightDataBuffer[i];
+    }
+    preFlightBufferCount--;
+  }
+}
 
 /***************************************************************
- * カメラの画像取得時コールバック（動画記録用）
+ * flushPreFlightBufferToCSV()
+ * 前段記録用バッファの内容をCSVファイルへ書き出す関数
  ***************************************************************/
 void CamCB(CamImage img) {
   if (!useCamera) return;
@@ -265,11 +304,8 @@ void CamCB(CamImage img) {
 }
 
 /***************************************************************
- * readAndLogSensors() 関数（フライト中用）
- * ※ 取得した加速度値は以下の補正を適用する：
- *     correctedAccelX = - rawAccelZ
- *     correctedAccelY = rawAccelY
- *     correctedAccelZ = rawAccelX
+ * readAndLogSensors()
+ * フライト中にセンサーデータを取得し、バッファに追加する関数
  ***************************************************************/
 void readAndLogSensors() {
   float nowSec = (millis() - startTime) / 1000.0f;
@@ -305,18 +341,18 @@ void readAndLogSensors() {
   int satellites  = gnssData.numSatellites;
   float totalAccel = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
   
-  // 気圧トレンド検出
+  // 気圧トレンド検出（pressureはdata.pressure）
   if (lastPressure == 0.0) {
-    lastPressure = pressure;
+    lastPressure = data.pressure;
   } else {
-    if (pressure < lastPressure) {
+    if (data.pressure < lastPressure) {
       consecutivePressureDecrease++;
       consecutivePressureIncrease = 0;
-    } else if (pressure > lastPressure) {
+    } else if (data.pressure > lastPressure) {
       consecutivePressureIncrease++;
       consecutivePressureDecrease = 0;
     }
-    lastPressure = pressure;
+    lastPressure = data.pressure;
   }
   if (consecutivePressureDecrease >= 5) {
     ascendingDetected = true;
@@ -331,46 +367,28 @@ void readAndLogSensors() {
     }
   }
   
-  if (!parachuteDeployed && totalAccel < FREEFALL_THRESHOLD) {
+  // 加速度による自由落下検知
+  if (!parachuteDeployed && data.totalAccel < FREEFALL_THRESHOLD) {
     event("加速度検知（条件成立）：自由落下と判断");
     deployMethod = "加速度検知による";
     deployParachute();
   }
   
-  String line;
-  line += String(nowSec, 3) + ",";
-  line += String(temperature, 2) + ",";
-  line += String(humidity, 2) + ",";
-  line += String(pressure, 2) + ",";
-  line += String(latitude, 6) + ",";
-  line += String(longitude, 6) + ",";
-  line += String(altitude, 2) + ",";
-  line += (fix ? "1" : "0");
-  line += ",";
-  line += String(satellites) + ",";
-  line += String(accelX, 4) + ",";
-  line += String(accelY, 4) + ",";
-  line += String(accelZ, 4) + ",";
-  line += String(gyroX, 4) + ",";
-  line += String(gyroY, 4) + ",";
-  line += String(gyroZ, 4) + ",";
-  line += String(totalAccel, 3);
-  
-  if (batchIndex < BATCH_SIZE) {
-    csvBuffer[batchIndex] = line;
-    batchIndex++;
-  }
+  // バッファ（csvBuffer）に追加し、BATCH_SIZE件ごとにSD/Flashへ書き込み
+  csvBuffer[batchIndex] = line;
+  batchIndex++;
   if (batchIndex >= BATCH_SIZE) {
     flushCsvBuffer();
   }
+  
+  // シリアル出力（必要なら残すが、処理高速化のため必要最低限に）
   printSensorDataToSerial(
-    nowSec,
-    temperature, humidity, pressure,
-    latitude, longitude, altitude,
-    fix, satellites,
-    accelX, accelY, accelZ,
-    gyroX, gyroY, gyroZ,
-    totalAccel
+    data.time_s, data.temperature, data.humidity, data.pressure,
+    data.latitude, data.longitude, data.altitude,
+    data.fix, data.satellites,
+    data.accelX, data.accelY, data.accelZ,
+    data.gyroX, data.gyroY, data.gyroZ,
+    data.totalAccel
   );
   
   // 安全機構：離陸後の3秒タイマーはフライトピンが切られてから開始するため、
@@ -492,7 +510,7 @@ void flushCsvBuffer() {
       handleError(9);
       return;
     }
-    event("Flushed 10 lines to CSV (Flash)");
+    event("Flushed 50 lines to CSV (Flash)");
     return;
   }
   File csvFile = SD.open(csvFilename, FILE_WRITE);
@@ -507,7 +525,47 @@ void flushCsvBuffer() {
     sdErrorHappened = true;
     return;
   }
-  event("Flushed 10 lines to CSV (SD)");
+  event("Flushed 50 lines to CSV (SD)");
+}
+
+/***************************************************************
+ * flushPreFlightBuffer() 関数
+ * 前段記録ファイルを明示的にフラッシュする
+ ***************************************************************/
+void flushPreFlightBuffer() {
+  if (sdErrorHappened) {
+    File flashFile = Flash.open(preFlightFilename, FILE_WRITE);
+    if (flashFile) {
+      flashFile.flush();
+      flashFile.close();
+    }
+    return;
+  }
+  File pfFile = SD.open(preFlightFilename, FILE_WRITE);
+  if (pfFile) {
+    pfFile.flush();
+    pfFile.close();
+  }
+}
+
+/***************************************************************
+ * flushPreFlightBuffer() 関数
+ * 前段記録ファイルを明示的にフラッシュする
+ ***************************************************************/
+void flushPreFlightBuffer() {
+  if (sdErrorHappened) {
+    File flashFile = Flash.open(preFlightFilename, FILE_WRITE);
+    if (flashFile) {
+      flashFile.flush();
+      flashFile.close();
+    }
+    return;
+  }
+  File pfFile = SD.open(preFlightFilename, FILE_WRITE);
+  if (pfFile) {
+    pfFile.flush();
+    pfFile.close();
+  }
 }
 
 /***************************************************************
@@ -563,51 +621,35 @@ void event(String msg) {
 }
 
 /***************************************************************
- * handleError() 関数
- * エラー発生時は、エラーコードに応じたエラー内容を書き込み、LEDを点滅する
+ * handleError()
+ * エラーコードに応じたエラー出力とLED点滅
  ***************************************************************/
 void handleError(int errCode) {
   String errDetail;
   switch(errCode) {
-    case 1:
-      errDetail = "SDカード初期化失敗";
-      break;
-    case 2:
-      errDetail = "CSV/LOGファイル作成失敗";
-      break;
-    case 3:
-      errDetail = "BME280センサーが見つからない";
-      break;
-    case 4:
-      errDetail = "MPU6050接続失敗";
-      break;
-    case 5:
-      errDetail = "GNSS初期化失敗";
-      break;
-    case 9:
-      errDetail = "Flashへの書き込み失敗";
-      break;
-    default:
-      errDetail = "不明なエラー";
-      break;
+    case 1: errDetail = "SDカード初期化失敗"; break;
+    case 2: errDetail = "CSV/LOGファイル作成失敗"; break;
+    case 3: errDetail = "BME280センサーが見つからない"; break;
+    case 4: errDetail = "MPU6050接続失敗"; break;
+    case 5: errDetail = "GNSS初期化失敗"; break;
+    case 9: errDetail = "Flashへの書き込み失敗"; break;
+    default: errDetail = "不明なエラー"; break;
   }
   event("Error occurred, code = " + String(errCode) + ": " + errDetail);
-  
   for (int i = 0; i < errCode; i++) {
     digitalWrite(PIN_LED3, HIGH);
     delay(300);
     digitalWrite(PIN_LED3, LOW);
     delay(300);
   }
-  
   if (!continueOnError) {
     errorLoop(errCode, errDetail);
   }
 }
 
 /***************************************************************
- * errorLoop() 関数
- * continueOnError が false の場合、無限ループでエラー内容を表示し、LEDを点滅する
+ * errorLoop()
+ * continueOnErrorがfalseの場合の無限ループ
  ***************************************************************/
 void errorLoop(int errCode, String errMsg) {
   while (true) {
@@ -630,7 +672,7 @@ void Led_isActive() {
   unsigned long current = millis();
   if (current - lastToggle >= 500) {
     state = !state;
-    digitalWrite(PIN_LED0, (state ? HIGH : LOW));
+    digitalWrite(PIN_LED0, state ? HIGH : LOW);
     lastToggle = current;
   }
 }
@@ -644,8 +686,8 @@ void Led_isError(bool state) {
 }
 
 /***************************************************************
- * printSensorDataToSerial() 関数
- * センサーデータをシリアルモニターに出力する
+ * printSensorDataToSerial()
+ * センサーデータをシリアルモニターに出力する関数
  ***************************************************************/
 void printSensorDataToSerial(
   float time_s,
@@ -734,13 +776,13 @@ void startFlight(String reason) {
 }
 
 /***************************************************************
- * getNextFileIndex() 関数
+ * getNextFileIndex()
+ * CSV/LOGファイルの次の連番を決定する関数
  ***************************************************************/
 int getNextFileIndex() {
   int idx = 0;
   while (true) {
-    String csvCandidate;
-    String logCandidate;
+    String csvCandidate, logCandidate;
     if (idx == 0) {
       csvCandidate = String(CSV_BASE) + String(CSV_EXT);
       logCandidate = String(LOG_BASE) + String(LOG_EXT);
@@ -748,36 +790,33 @@ int getNextFileIndex() {
       csvCandidate = String(CSV_BASE) + String(idx) + String(CSV_EXT);
       logCandidate = String(LOG_BASE) + String(idx) + String(LOG_EXT);
     }
-    bool csvExist = SD.exists(csvCandidate);
-    bool logExist = SD.exists(logCandidate);
-    if (!csvExist && !logExist) {
+    if (!SD.exists(csvCandidate) && !SD.exists(logCandidate))
       return idx;
-    }
     idx++;
   }
 }
 
 /***************************************************************
- * getNextPreFlightFileIndex() 関数
+ * getNextPreFlightFileIndex()
+ * 前段記録用ファイルの次の連番を決定する関数
  ***************************************************************/
 int getNextPreFlightFileIndex() {
   int idx = 0;
   while (true) {
     String candidate;
-    if (idx == 0) {
+    if (idx == 0)
       candidate = String(PRE_FLIGHT_BASE) + String(PRE_FLIGHT_EXT);
-    } else {
+    else
       candidate = String(PRE_FLIGHT_BASE) + String(idx) + String(PRE_FLIGHT_EXT);
-    }
-    if (!SD.exists(candidate)) {
+    if (!SD.exists(candidate))
       return idx;
-    }
     idx++;
   }
 }
 
 /***************************************************************
- * initFlash() 関数
+ * initFlash()
+ * Flash初期化処理（必要ならフォーマットも実施）
  ***************************************************************/
 void initFlash() {
   if (formatFlashOnBoot) {
@@ -792,44 +831,42 @@ void initFlash() {
 }
 
 /***************************************************************
- * initGNSS() 関数
+ * initGNSS()
+ * GNSS初期化処理
  ***************************************************************/
 void initGNSS() {
   if (!useGNSS) return;
   int ret = Gnss.begin();
-  if (ret != 0) {
-    handleError(5);
-  }
+  if (ret != 0) handleError(5);
   Gnss.setInterval(GNSS_RATE);
   ret = Gnss.start();
-  if (ret != 0) {
-    handleError(5);
-  }
+  if (ret != 0) handleError(5);
 }
 
 /***************************************************************
- * initBME280() 関数
+ * initBME280()
+ * BME280センサー初期化処理
  ***************************************************************/
 void initBME280() {
   if (!useBME280) return;
   if (!bme.begin(0x76)) {
     handleError(3);
-  }
 }
 
 /***************************************************************
- * initMPU6050() 関数
+ * initMPU6050()
+ * MPU6050センサー初期化処理
  ***************************************************************/
 void initMPU6050() {
   if (!useMPU6050) return;
   mpu.initialize();
-  if (!mpu.testConnection()) {
+  if (!mpu.testConnection())
     handleError(4);
-  }
 }
 
 /***************************************************************
- * initSDandCSV() 関数
+ * initSDandCSV()
+ * SDカード初期化とCSV/LOGファイル作成処理
  ***************************************************************/
 void initSDandCSV() {
   if (!SD.begin()) {
@@ -867,19 +904,18 @@ void initSDandCSV() {
 }
 
 /***************************************************************
- * initPreFlightCSV() 関数
+ * initPreFlightCSV()
+ * 前段記録用CSVファイル作成処理
  ***************************************************************/
 void initPreFlightCSV() {
-  if (!SD.begin()) {
+  if (!SD.begin())
     return;
-  }
   int idx = getNextPreFlightFileIndex();
   String candidate;
-  if (idx == 0) {
+  if (idx == 0)
     candidate = String(PRE_FLIGHT_BASE) + String(PRE_FLIGHT_EXT);
-  } else {
+  else
     candidate = String(PRE_FLIGHT_BASE) + String(idx) + String(PRE_FLIGHT_EXT);
-  }
   File pfFile = SD.open(candidate, FILE_WRITE);
   if (pfFile) {
     pfFile.println("Time_s,Temperature_C,Humidity_%,Pressure_hPa,Lat,Lng,Alt_m,Fix,Sats,AccelX_g,AccelY_g,AccelZ_g,GyroX_deg_s,GyroY_deg_s,GyroZ_deg_s,TotalAccel");
@@ -891,7 +927,8 @@ void initPreFlightCSV() {
 }
 
 /***************************************************************
- * setup() 関数
+ * setup()
+ * 各種初期化処理
  ***************************************************************/
 void setup() {
   Serial.begin(115200);
@@ -919,7 +956,8 @@ void setup() {
 }
 
 /***************************************************************
- * loop() 関数
+ * loop()
+ * メインループ：フライト前は前段記録、フライト検知後は通常の記録＆動画処理
  ***************************************************************/
 void loop() {
   unsigned long currentMillis = millis();
@@ -931,28 +969,28 @@ void loop() {
     Led_isPosfix(fixState);
   }
   
+  // フライト前：50ms間隔で前段記録用データを蓄積（常に直近10秒分のみ保持）
   if (!flightStarted) {
-    if (currentMillis - previousPreFlightMillis >= PRE_FLIGHT_INTERVAL) {
-      previousPreFlightMillis = currentMillis;
-      readAndLogSensorsPreFlight();
+    if (currentMillis - previousPreFlightSensorMillis >= PREFLIGHT_SENSOR_INTERVAL) {
+      previousPreFlightSensorMillis = currentMillis;
+      recordPreFlightSensorData();
     }
+    // フライトピンが切られたと判断
     if (digitalRead(PIN_FLIGHT_INPUT) == HIGH) {
       startFlight("Flight pin cut.");
     }
     return;
   }
   
-  if (currentMillis - previousBme280Millis >= BME280_INTERVAL) {
+  // フライト中：各センサ更新間隔に従って処理
+  if (currentMillis - previousBme280Millis >= BME280_INTERVAL)
     previousBme280Millis = currentMillis;
-  }
-  if (currentMillis - previousMpu6050Millis >= MPU6050_INTERVAL) {
+  if (currentMillis - previousMpu6050Millis >= MPU6050_INTERVAL)
     previousMpu6050Millis = currentMillis;
-  }
   
   readAndLogSensors();
   
-  if (currentMillis - previousSerialMillis >= SERIAL_PRINT_INTERVAL) {
+  if (currentMillis - previousSerialMillis >= SERIAL_PRINT_INTERVAL)
     previousSerialMillis = currentMillis;
-  }
   
 }

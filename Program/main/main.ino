@@ -868,9 +868,6 @@ void setup() {
   event("All initialization completed. Waiting for flight event...");
 }
 
-/***************************************************************
- * loop() 関数
- ***************************************************************/
 void loop() {
   unsigned long currentMillis = millis();
   Led_isActive();
