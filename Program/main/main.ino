@@ -4,7 +4,7 @@
  * GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
  * 変更点:
-*   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 before_flight.csv）
+ *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 before_flight.csv）
  *   2) センサーデータを10回分バッファにため、まとめて書き込む（フライト開始後）
  *   3) 書き込みエラーがあった場合はバッファを保持し、次回以降リトライ
  *   4) 書き込み完了後にイベントログへ記録
@@ -17,7 +17,7 @@
  *
  * ★ 追加変更点: 前段記録（Pre-flight logging）＋加速度測定
  *   - 起動後、フライトピンが切れるまで（ショート状態）の間、1秒間隔でセンサーデータを
-*     "before_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
+ *     "before_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
  *   - フライト中も TotalAccel を記録し、TotalAccel が FREEFALL_THRESHOLD 以下になった場合、
  *     加速度による自由落下検知としパラシュート展開のトリガーとする。
  *   - また、気圧センサのサンプルで5回連続で気圧が減少して「上昇中」と判定し、
@@ -39,7 +39,6 @@
 #include <MPU6050.h>         // MPU6050
 #include <GNSS.h>            // GNSS Addon
 #include <Flash.h>           // SpresenseのFlash制御クラス
-#include <Servo.h>           // サーボ制御
 
 // ★ カメラ・動画関連ライブラリ ★
 #include <Camera.h>          // カメラ制御用ライブラリ
@@ -56,6 +55,14 @@
  ***************************************************************/
 bool formatFlashOnBoot = false;
 bool continueOnError = true; // エラー発生時、true なら処理続行、false なら停止
+
+/***************************************************************
+ * 機能ON/OFF設定
+ ***************************************************************/
+bool useBME280  = true;  // BME280 センサーを使用するか
+bool useMPU6050 = true;  // MPU6050 センサーを使用するか
+bool useGNSS    = true;  // GNSS を使用するか
+bool useCamera  = true;  // カメラで動画を記録するか
 
 /***************************************************************
  * ファイル名関連定数
@@ -118,7 +125,6 @@ SpGnssAddon Gnss;
 Adafruit_BME280 bme;
 MPU6050 mpu;
 SpNavData gnssData;
-static Servo s_servo;
 String csvFilename;
 String logFilename;
 String preFlightFilename;
@@ -138,8 +144,6 @@ int preFlightAccCount = 0;
  ***************************************************************/
 #define FREEFALL_THRESHOLD 0.6  // g 以下なら自由落下とみなす
 bool parachuteDeployed = false;
-bool apexDetected = false;
-uint32_t apexTime = 0;
 
 /***************************************************************
  * 追加：気圧トレンド検出用変数
@@ -199,6 +203,7 @@ uint32_t lastFrameTime = 0;
  * カメラの画像取得時コールバック（動画記録用）
  ***************************************************************/
 void CamCB(CamImage img) {
+  if (!useCamera) return;
   if (!img.isAvailable()) return;
   uint32_t currentTime = millis();
   if (lastFrameTime != 0) {
@@ -265,11 +270,18 @@ void CamCB(CamImage img) {
  ***************************************************************/
 void readAndLogSensors() {
   float nowSec = (millis() - startTime) / 1000.0f;
-  float temperature = bme.readTemperature();
-  float humidity    = bme.readHumidity();
-  float pressure    = bme.readPressure() / 100.0f;  // hPa
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float pressure    = 0.0f;  // hPa
+  if (useBME280) {
+    temperature = bme.readTemperature();
+    humidity    = bme.readHumidity();
+    pressure    = bme.readPressure() / 100.0f;
+  }
+  int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+  if (useMPU6050) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  }
   float accelX = ax / 16384.0f;
   float accelY = ay / 16384.0f;
   float accelZ = az / 16384.0f;
@@ -366,11 +378,18 @@ void readAndLogSensors() {
  ***************************************************************/
 void readAndLogSensorsPreFlight() {
   float nowSec = (millis() - startTime) / 1000.0f;
-  float temperature = bme.readTemperature();
-  float humidity    = bme.readHumidity();
-  float pressure    = bme.readPressure() / 100.0f;
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float pressure    = 0.0f;
+  if (useBME280) {
+    temperature = bme.readTemperature();
+    humidity    = bme.readHumidity();
+    pressure    = bme.readPressure() / 100.0f;
+  }
+  int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+  if (useMPU6050) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  }
   float accelX = ax / 16384.0f;
   float accelY = ay / 16384.0f;
   float accelZ = az / 16384.0f;
@@ -634,11 +653,9 @@ void printSensorDataToSerial(
 void deployParachute() {
   if (parachuteDeployed) return; // 重複実行防止
   parachuteDeployed = true;  // 展開済みとマーク
-  // 1秒待機してから実際の処理を実施
+  // 1秒待機してログに記録するだけ
   delay(1000);
-  event("Parachute deployed via free-fall or safety timer (delayed 1 sec).");
-  // サーボ等によるパラシュート展開処理（例）
-  s_servo.write(0);
+  event("Parachute deployment logged via free-fall or safety timer (delayed 1 sec).");
 }
 
 /***************************************************************
@@ -710,6 +727,7 @@ void initFlash() {
  * initGNSS() 関数
  ***************************************************************/
 void initGNSS() {
+  if (!useGNSS) return;
   int ret = Gnss.begin();
   if (ret != 0) {
     Serial.println("Error: Gnss.begin() fail");
@@ -728,6 +746,7 @@ void initGNSS() {
  * initBME280() 関数
  ***************************************************************/
 void initBME280() {
+  if (!useBME280) return;
   if (!bme.begin(0x76)) {
     Serial.println("Could not find a valid BME280 sensor!");
     handleError(3);
@@ -739,6 +758,7 @@ void initBME280() {
  * initMPU6050() 関数
  ***************************************************************/
 void initMPU6050() {
+  if (!useMPU6050) return;
   mpu.initialize();
   if (!mpu.testConnection()) {
     Serial.println("MPU6050 connection failed");
@@ -841,10 +861,10 @@ void setup() {
   initMPU6050();
   initSDandCSV();
   initPreFlightCSV();
-  s_servo.attach(PIN_D12);
-  s_servo.write(90);
-  const int buff_num = 2;
-  theCamera.begin(buff_num, CAM_VIDEO_FPS_60, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V, CAM_IMAGE_PIX_FMT_JPG, 5);
+  if (useCamera) {
+    const int buff_num = 2;
+    theCamera.begin(buff_num, CAM_VIDEO_FPS_60, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V, CAM_IMAGE_PIX_FMT_JPG, 5);
+  }
   event("All initialization completed. Waiting for flight event...");
 }
 
@@ -854,7 +874,7 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   Led_isActive();
-  if (Gnss.waitUpdate(0)) {
+  if (useGNSS && Gnss.waitUpdate(0)) {
     Gnss.getNavData(&gnssData);
     bool fixState = (gnssData.posDataExist && (gnssData.posFixMode != FixInvalid));
     Led_isPosfix(fixState);
@@ -867,15 +887,17 @@ void loop() {
     if (digitalRead(PIN_FLIGHT_INPUT) == HIGH) {
       flightStarted = true;
       event("Flight event detected: Flight pin cut. Starting sensor logging and video recording.");
-      String newFilename = baseFilename + String(segmentIndex) + ".avi";
-      theSD.remove(newFilename);
-      aviFile = theSD.open(newFilename, FILE_WRITE);
-      pAvi = new AviLibrary();
-      pAvi->begin(aviFile, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V);
-      overallStartTime_video = millis();
-      segmentStartTime = overallStartTime_video;
-      theCamera.startStreaming(true, CamCB);
-      pAvi->startRecording();
+      if (useCamera) {
+        String newFilename = baseFilename + String(segmentIndex) + ".avi";
+        theSD.remove(newFilename);
+        aviFile = theSD.open(newFilename, FILE_WRITE);
+        pAvi = new AviLibrary();
+        pAvi->begin(aviFile, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V);
+        overallStartTime_video = millis();
+        segmentStartTime = overallStartTime_video;
+        theCamera.startStreaming(true, CamCB);
+        pAvi->startRecording();
+      }
     }
     return;
   }
