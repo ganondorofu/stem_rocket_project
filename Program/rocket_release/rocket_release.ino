@@ -57,6 +57,15 @@ bool formatFlashOnBoot = false;
 bool continueOnError = true; // エラー発生時、trueなら処理続行、falseなら停止
 
 /***************************************************************
+ * デバッグ出力設定
+ ***************************************************************/
+bool debugPrintSensors = true;   // センサーデータをシリアルに出力するか
+bool debugPrintBME280  = true;   // 温湿度・気圧
+bool debugPrintMPU6050 = true;   // 加速度・ジャイロ
+bool debugPrintGNSS    = true;   // GNSS 位置情報
+bool debugPrintEvents  = true;   // event() ログをシリアルに出力するか
+
+/***************************************************************
  * ファイル名関連定数
  ***************************************************************/
 #define CSV_BASE       "sensor_data"
@@ -428,11 +437,13 @@ void readAndLogSensorsPreFlight() {
   preFlightAccCount++;
   if (preFlightAccCount >= 5) {
     float avgAcc = preFlightAccSum / preFlightAccCount;
-    Serial.print("Average Acceleration (pre-flight over ");
-    Serial.print(preFlightAccCount);
-    Serial.print(" samples): ");
-    Serial.print(avgAcc, 3);
-    Serial.println(" g");
+    if (debugPrintSensors) {
+      Serial.print("Average Acceleration (pre-flight over ");
+      Serial.print(preFlightAccCount);
+      Serial.print(" samples): ");
+      Serial.print(avgAcc, 3);
+      Serial.println(" g");
+    }
     preFlightAccSum = 0;
     preFlightAccCount = 0;
   }
@@ -503,8 +514,10 @@ void flushPreFlightBuffer() {
 void event(String msg) {
   float t = (millis() - startTime) / 1000.0f;
   String s = String(t, 3) + ": " + msg;
-  // シリアルモニターにも出力
-  Serial.println(s);
+  // シリアルモニターへの出力はデバッグ設定に従う
+  if (debugPrintEvents) {
+    Serial.println(s);
+  }
   if (sdErrorHappened) {
     File f = Flash.open("event.txt", FILE_WRITE);
     if (f) {
@@ -620,37 +633,46 @@ void printSensorDataToSerial(
   float gyroX, float gyroY, float gyroZ,
   float totalAccel
 ) {
+  if (!debugPrintSensors) return;
   Serial.print("Time: ");
   Serial.print(time_s, 3);
-  Serial.print(" s, Temp: ");
-  Serial.print(temperature, 2);
-  Serial.print(" C, Humi: ");
-  Serial.print(humidity, 2);
-  Serial.print(" %, Press: ");
-  Serial.print(pressure, 2);
-  Serial.print(" hPa, Lat: ");
-  Serial.print(latitude, 6);
-  Serial.print(", Lng: ");
-  Serial.print(longitude, 6);
-  Serial.print(", Alt: ");
-  Serial.print(altitude, 2);
-  Serial.print(" m, Fix: ");
-  Serial.print(fix);
-  Serial.print(", Sats: ");
-  Serial.print(satellites);
-  Serial.print(", AccelX: ");
-  Serial.print(accelX, 4);
-  Serial.print(" g, AccelY: ");
-  Serial.print(accelY, 4);
-  Serial.print(" g, AccelZ: ");
-  Serial.print(accelZ, 4);
-  Serial.print(" g, GyroX: ");
-  Serial.print(gyroX, 4);
-  Serial.print(" dps, GyroY: ");
-  Serial.print(gyroY, 4);
-  Serial.print(" dps, GyroZ: ");
-  Serial.print(gyroZ, 4);
-  Serial.print(" dps, TotalAccel: ");
+  if (debugPrintBME280) {
+    Serial.print(" s, Temp: ");
+    Serial.print(temperature, 2);
+    Serial.print(" C, Humi: ");
+    Serial.print(humidity, 2);
+    Serial.print(" %, Press: ");
+    Serial.print(pressure, 2);
+    Serial.print(" hPa");
+  }
+  if (debugPrintGNSS) {
+    Serial.print(", Lat: ");
+    Serial.print(latitude, 6);
+    Serial.print(", Lng: ");
+    Serial.print(longitude, 6);
+    Serial.print(", Alt: ");
+    Serial.print(altitude, 2);
+    Serial.print(" m, Fix: ");
+    Serial.print(fix);
+    Serial.print(", Sats: ");
+    Serial.print(satellites);
+  }
+  if (debugPrintMPU6050) {
+    Serial.print(", AccelX: ");
+    Serial.print(accelX, 4);
+    Serial.print(" g, AccelY: ");
+    Serial.print(accelY, 4);
+    Serial.print(" g, AccelZ: ");
+    Serial.print(accelZ, 4);
+    Serial.print(" g, GyroX: ");
+    Serial.print(gyroX, 4);
+    Serial.print(" dps, GyroY: ");
+    Serial.print(gyroY, 4);
+    Serial.print(" dps, GyroZ: ");
+    Serial.print(gyroZ, 4);
+    Serial.print(" dps");
+  }
+  Serial.print(", TotalAccel: ");
   Serial.print(totalAccel, 3);
   Serial.println(" g");
 }
