@@ -4,7 +4,7 @@
  * GNSSは非同期処理 (waitUpdate(0)) で、ほかの処理をブロックしないようにする
  *
  * 変更点:
- *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 befor_flight.csv）
+ *   1) 既存ファイルがあれば連番付きファイル名を生成（CSV, LOG, 前段記録用 before_flight.csv）
  *   2) センサーデータを10回分バッファにため、まとめて書き込む（フライト開始後）
  *   3) 書き込みエラーがあった場合はバッファを保持し、次回以降リトライ
  *   4) 書き込み完了後にイベントログへ書き込み
@@ -17,7 +17,7 @@
  *
  * ★ 追加変更点: 前段記録（Pre-flight logging）＋加速度測定
  *   - 起動後、フライトピンが切れるまで（ショート状態）の間、1秒間隔でセンサーデータを
- *     "befor_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
+ *     "before_flight.csv" として連番付きで記録し、TotalAccel（加速度の大きさ）も記録する。
  *   - フライト中も TotalAccel を記録し、TotalAccel が FREEFALL_THRESHOLD 以下になった場合、
  *     加速度による自由落下検知としパラシュート展開のトリガーとする。
  *   - また、気圧センサのサンプルで5回連続で気圧が減少して「上昇中」と判定し、
@@ -124,6 +124,8 @@ int preFlightBufferCount = 0;
  ***************************************************************/
 #define PIN_FLIGHT_OUTPUT 8
 #define PIN_FLIGHT_INPUT  9
+#define FREEFALL_THRESHOLD 0.8  // g 以下なら自由落下とみなす
+#define LAUNCH_ACCEL_THRESHOLD 3.0  // g 超なら離陸と判定
 
 // フライトイベントフラグ
 bool flightStarted = false;
@@ -155,7 +157,19 @@ bool flashInitialized = false;
  ***************************************************************/
 float preFlightAccSum = 0.0;
 int preFlightAccCount = 0;
-
+/***************************************************************
+ * グローバル変数（カメラ・動画関連）
+ ***************************************************************/
+File aviFile;
+AviLibrary* pAvi;
+const uint32_t SEGMENT_DURATION_MS = 3000;
+const uint32_t TOTAL_DURATION_MS   = 50000;
+uint32_t overallStartTime_video = 0;
+uint32_t segmentStartTime = 0;
+int segmentIndex = 0;
+unsigned long frameCount = 0;
+String baseFilename = "movie";
+uint32_t lastFrameTime = 0;
 /***************************************************************
  * 追加：パラシュート展開用
  ***************************************************************/
@@ -163,11 +177,6 @@ int preFlightAccCount = 0;
 // 加速度による離陸検知用しきい値
 #define LAUNCH_ACCEL_THRESHOLD 3.0  // g 超なら離陸と判定
 bool parachuteDeployed = false;
-bool apexDetected = false;
-uint32_t apexTime = 0;
-// deployPending: パラシュート展開保留状態フラグ、deployStartTime: 展開要求時刻
-bool deployPending = false;
-unsigned long deployStartTime = 0;
 // deployMethod: 展開条件の理由を記録するグローバル変数
 String deployMethod = "";
 
@@ -193,6 +202,8 @@ void initPreFlightCSV();
 void readAndLogSensors();
 void flushCsvBuffer();
 void readAndLogSensorsPreFlight();
+void flushPreFlightBuffer();
+void startFlight(String reason);
 void event(String msg);
 void handleError(int errCode);
 void errorLoop(int errCode, String errMsg);
@@ -211,6 +222,7 @@ void printSensorDataToSerial(
 );
 
 /***************************************************************
+
  * recordPreFlightSensorData()
  * 前段記録用にセンサーデータを取得し、循環バッファに保存する関数
  * 古い（10秒以上前の）データは自動的に削除
@@ -247,6 +259,7 @@ void recordPreFlightSensorData() {
  * 前段記録用バッファの内容をCSVファイルへ書き出す関数
  ***************************************************************/
 void CamCB(CamImage img) {
+  if (!useCamera) return;
   if (!img.isAvailable()) return;
   uint32_t currentTime = millis();
   if (lastFrameTime != 0) {
@@ -296,11 +309,18 @@ void CamCB(CamImage img) {
  ***************************************************************/
 void readAndLogSensors() {
   float nowSec = (millis() - startTime) / 1000.0f;
-  float temperature = bme.readTemperature();
-  float humidity    = bme.readHumidity();
-  float pressure    = bme.readPressure() / 100.0f;
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float pressure    = 0.0f;
+  if (useBME280) {
+    temperature = bme.readTemperature();
+    humidity    = bme.readHumidity();
+    pressure    = bme.readPressure() / 100.0f;
+  }
+  int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+  if (useMPU6050) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  }
   
   // raw加速度値をg単位に変換
   float rawAccelX = ax / 16384.0f;
@@ -373,7 +393,7 @@ void readAndLogSensors() {
   
   // 安全機構：離陸後の3秒タイマーはフライトピンが切られてから開始するため、
   // flightStartTime を利用する
-  if (!parachuteDeployed && (millis() - flightStartTime >= 2000)) {
+  if (!parachuteDeployed && (millis() - flightStartTime >= 3000)) {
     event("安全機構条件成立：離陸から3秒経過");
     deployMethod = "安全機構による";
     deployParachute();
@@ -386,11 +406,18 @@ void readAndLogSensors() {
  ***************************************************************/
 void readAndLogSensorsPreFlight() {
   float nowSec = (millis() - startTime) / 1000.0f;
-  float temperature = bme.readTemperature();
-  float humidity    = bme.readHumidity();
-  float pressure    = bme.readPressure() / 100.0f;
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float pressure    = 0.0f;
+  if (useBME280) {
+    temperature = bme.readTemperature();
+    humidity    = bme.readHumidity();
+    pressure    = bme.readPressure() / 100.0f;
+  }
+  int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+  if (useMPU6050) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  }
   
   float rawAccelX = ax / 16384.0f;
   float rawAccelY = ay / 16384.0f;
@@ -450,8 +477,19 @@ void readAndLogSensorsPreFlight() {
   preFlightAccSum += totalAccel;
   preFlightAccCount++;
   if (preFlightAccCount >= 5) {
+    float avgAcc = preFlightAccSum / preFlightAccCount;
+    if (debugPrintSensors) {
+      Serial.print("Average Acceleration (pre-flight over ");
+      Serial.print(preFlightAccCount);
+      Serial.print(" samples): ");
+      Serial.print(avgAcc, 3);
+      Serial.println(" g");
+    }
     preFlightAccSum = 0;
     preFlightAccCount = 0;
+  }
+  if (!flightStarted && useMPU6050 && totalAccel > LAUNCH_ACCEL_THRESHOLD) {
+    startFlight("Acceleration threshold exceeded.");
   }
 }
 
@@ -511,14 +549,36 @@ void flushPreFlightBuffer() {
 }
 
 /***************************************************************
- * event()
- * SD/Flashへのログ出力（シリアル出力も追加）
+ * flushPreFlightBuffer() 関数
+ * 前段記録ファイルを明示的にフラッシュする
+ ***************************************************************/
+void flushPreFlightBuffer() {
+  if (sdErrorHappened) {
+    File flashFile = Flash.open(preFlightFilename, FILE_WRITE);
+    if (flashFile) {
+      flashFile.flush();
+      flashFile.close();
+    }
+    return;
+  }
+  File pfFile = SD.open(preFlightFilename, FILE_WRITE);
+  if (pfFile) {
+    pfFile.flush();
+    pfFile.close();
+  }
+}
+
+/***************************************************************
+ * event() 関数
+ * SD/Flashへのログ書き込みのみ実施（デバッグ出力なし）→シリアルモニター出力追加
  ***************************************************************/
 void event(String msg) {
   float t = (millis() - startTime) / 1000.0f;
   String s = String(t, 3) + ": " + msg;
-  // シリアルモニターにも出力
-  Serial.println(s);
+  // シリアルモニターへの出力はデバッグ設定に従う
+  if (debugPrintEvents) {
+    Serial.println(s);
+  }
   if (sdErrorHappened) {
     File f = Flash.open("event.txt", FILE_WRITE);
     if (f) {
@@ -663,8 +723,8 @@ void printSensorDataToSerial(
 }
 
 /***************************************************************
- * deployParachute() 関数（非ブロッキング実装）
- * deployParachute() が呼ばれたら、deployPending フラグを立て、1秒後に実際の処理を実施する。
+ * deployParachute() 関数
+ * パラシュート展開をログに記録するだけの簡易実装
  ***************************************************************/
 void deployParachute() {
   if (parachuteDeployed) return;
@@ -768,6 +828,7 @@ void initGNSS() {
  * BME280センサー初期化処理
  ***************************************************************/
 void initBME280() {
+  if (!useBME280) return;
   if (!bme.begin(0x76)) {
     handleError(3);
 }
@@ -896,19 +957,7 @@ void loop() {
     }
     // フライトピンが切られたと判断
     if (digitalRead(PIN_FLIGHT_INPUT) == HIGH) {
-      flightStarted = true;
-      // フライトピンが切られた時点で flightStartTime を記録する
-      flightStartTime = millis();
-      event("Flight event detected: Flight pin cut. Starting sensor logging and video recording.");
-      String newFilename = baseFilename + String(segmentIndex) + ".avi";
-      theSD.remove(newFilename);
-      aviFile = theSD.open(newFilename, FILE_WRITE);
-      pAvi = new AviLibrary();
-      pAvi->begin(aviFile, CAM_IMGSIZE_QVGA_H, CAM_IMGSIZE_QVGA_V);
-      overallStartTime_video = millis();
-      segmentStartTime = overallStartTime_video;
-      theCamera.startStreaming(true, CamCB);
-      pAvi->startRecording();
+      startFlight("Flight pin cut.");
     }
     return;
   }
@@ -924,11 +973,4 @@ void loop() {
   if (currentMillis - previousSerialMillis >= SERIAL_PRINT_INTERVAL)
     previousSerialMillis = currentMillis;
   
-  // deployPending 非ブロッキング展開処理：1秒後に実際の処理を実施
-  if (deployPending && (millis() - deployStartTime >= 1000)) {
-    event("Parachute deployed via " + deployMethod + " (delayed 1 sec).");
-    s_servo.write(0);
-    deployPending = false;
-    parachuteDeployed = true;
-  }
 }
